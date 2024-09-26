@@ -95,6 +95,7 @@ define Host/Compile
 	$(call cc,xorimage)
 	$(call cc,zyimage,-Wall)
 	$(call cc,zyxbcm)
+	$(call cc,cvimg)
 endef
 
 define Host/Install
