@@ -37,6 +37,9 @@ realtek_board_detect() {
 	*"ACTIONRF1200 V1")
 		name="actionrf1200-v1"
 		;;
+        *"ipTIME A2004R")
+                name="iptime-a2004"
+                ;;
 	esac
 
 	# use generic board detect if no name is set

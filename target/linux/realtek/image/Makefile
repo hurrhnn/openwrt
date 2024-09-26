@@ -7,7 +7,7 @@
 include $(TOPDIR)/rules.mk
 include $(INCLUDE_DIR)/image.mk
 
-DEVICE_VARS += IMAGE_SIZE CVIMG_KERNEL_BURN_ADDR CVIMG_LOADER_START_ADDR CVIMG_ROOTFS_BURN_ADDR
+DEVICE_VARS += IMAGE_SIZE CVIMG_KERNEL_BURN_ADDR CVIMG_LOADER_START_ADDR CVIMG_ROOTFS_BURN_ADDR CVIMG_CPU_TYPE DEV_PROFILE LZMA_TEXT_START KERNEL_LOADADDR
 
 define Build/loader-common
   rm -rf $@.src
@@ -16,7 +16,8 @@ define Build/loader-common
      TARGET_DIR="$(dir $@)" LOADER_NAME="$(notdir $@)" \
      BOARD="$(DEV_PROFILE)" \
      SUBTARGET="$(SUBTARGET)" \
-     LZMA_TEXT_START=0x81000000 LOADADDR=0x80000000 \
+     LZMA_TEXT_START=$(CVIMG_LOADER_START_ADDR) \
+     LOADADDR=$(KERNEL_LOADADDR) \
      $(1) compile loader.bin
   mv "$@.bin" "$@"
   rm -rf $@.src
@@ -37,7 +38,7 @@ define Build/cvimg-kernel
         $(call Build/cvimg, \
                 -e $(CVIMG_LOADER_START_ADDR) \
                 -b $(CVIMG_KERNEL_BURN_ADDR) \
-                -c new \
+                -c $(CVIMG_CPU_TYPE) \
                 -t kernel \
                 $(1))
 endef
@@ -46,7 +47,7 @@ define Build/cvimg-fw
         $(call Build/cvimg, \
                 -e $(CVIMG_LOADER_START_ADDR) \
                 -b $(CVIMG_KERNEL_BURN_ADDR) \
-                -c new \
+                -c $(CVIMG_CPU_TYPE) \
                 -t fw \
                 $(1))
 endef
@@ -63,7 +64,7 @@ define Build/cvimg-rootfs
         $(call Build/cvimg, \
                 -e $(CVIMG_ROOTFS_BURN_ADDR) \
                 -b $(CVIMG_ROOTFS_BURN_ADDR) \
-                -c new \
+                -c $(CVIMG_CPU_TYPE) \
                 -t rootfs \
                 $(1))
 endef
@@ -77,7 +78,7 @@ define Build/append-cvimg-rootfs
                 -o $(IMAGE_ROOTFS).new \
                 -e $(CVIMG_ROOTFS_BURN_ADDR) \
                 -b $(CVIMG_ROOTFS_BURN_ADDR) \
-                -c new \
+                -c $(CVIMG_CPU_TYPE) \
                 -t rootfs \
                 $(1) && (dd if=$(IMAGE_ROOTFS).new >> $@ && \
                         rm -f $(IMAGE_ROOTFS).new) || rm -f $@ $(IMAGE_ROOTFS).new
@@ -92,7 +93,7 @@ endef
 define Build/cvimg-pad-rootfs
         $(call Build/cvimg, \
                 -b $(CVIMG_KERNEL_BURN_ADDR) \
-                -c new \
+                -c $(CVIMG_CPU_TYPE) \
                 -a $(BLOCKSIZE) \
                 -t rootfs \
                 -j)
@@ -106,6 +107,8 @@ define Device/Default
   BLOCKSIZE := 4k
   PROFILES := Default $$(DEV_PROFILE)
   CVIMG_ROOTFS_BURN_ADDR := 0
+  CVIMG_CPU_TYPE := new
+  KERNEL_LOADADDR := 0x80000000
 endef
 
 define Device/RealtekDTS
@@ -147,6 +150,26 @@ define Device/DIR822C1
   IMAGE/sysupgrade.bin = append-kernel | append-fake-rootfs | append-rootfs | cvimg-kernel | pad-rootfs
 endef
 TARGET_DEVICES += DIR822C1
+
+define Device/IPTIMEA2004R
+  $(Device/RealtekDTS)
+  BLOCKSIZE := 64k
+  DEVICE_DTS := IPTIMEA2004R
+  DEVICE_TITLE := ipTIME A2004R
+  SUPPORTED_DEVICES := iptime-a2004r
+  IMAGE_SIZE := 3988k
+  DEV_PROFILE := a2004r
+  CMDLINE := console=ttyS0,38400
+  KERNEL := kernel-bin | append-dtb | lzma | loader-cmdline-compile
+  CVIMG_KERNEL_BURN_ADDR := 0x20000
+  CVIMG_LOADER_START_ADDR := 0x80500000
+  KERNEL_LOADADDR := 0x81000000
+  IMAGES := factory.bin sysupgrade.bin rootfs.bin
+  IMAGE/factory.bin = append-kernel | cvimg-kernel | append-rootfs
+  IMAGE/sysupgrade.bin = append-kernel | cvimg-kernel
+  IMAGE/rootfs.bin = append-rootfs
+endef
+TARGET_DEVICES += IPTIMEA2004R
 
 endif
 
