@@ -22,7 +22,7 @@
 #include "printf.h"
 #include "LzmaDecode.h"
 
-#undef LZMA_DEBUG
+#define LZMA_DEBUG
 
 #ifdef LZMA_DEBUG
 #  define DBG(f, a...)	printf(f, ## a)
@@ -158,7 +158,7 @@ void loader_main(unsigned long reg_a0, unsigned long reg_a1,
 		halt();
 	}
 
-	printf("Decompressing kernel... ");
+	printf("Decompressing kernel ... ");
 
 	res = lzma_decompress((unsigned char *) kernel_la);
 	if (res != LZMA_RESULT_OK) {
@@ -178,6 +178,12 @@ void loader_main(unsigned long reg_a0, unsigned long reg_a1,
 	flush_cache(kernel_la, lzma_outsize);
 
 	printf("Starting kernel at %08x...\n\n", kernel_la);
+        printf("Starting Memory Dump..\n");
+        printf("+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+\n");
+        for(int i = kernel_la; i <= kernel_la + 0x100; i += 0x10) {
+            printf("0x%08x: |%02X %02X %02X %02X|%02X %02X %02X %02X|%02X %02X %02X %02X|%02X %02X %02X %02X|\n", i, *(unsigned char *)i, *(unsigned char *)(i+1), *(unsigned char *)(i+2), *(unsigned char *)(i+3), *(unsigned char *)(i+4), *(unsigned char *)(i+5), *(unsigned char *)(i+6), *(unsigned char *)(i+7), *(unsigned char *)(i+8), *(unsigned char *)(i+9), *(unsigned char *)(i+10), *(unsigned char *)(i+11), *(unsigned char *)(i+12), *(unsigned char *)(i+13), *(unsigned char *)(i+14), *(unsigned char *)(i+15));
+        }
+        printf("+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+\n");
 
 #ifdef CONFIG_KERNEL_CMDLINE
 	reg_a0 = kernel_argc;
