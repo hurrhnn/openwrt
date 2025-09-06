@@ -21,6 +21,8 @@
 	chosen {
 		stdout-path = "serial0:115200n8";
 		bootargs-append = " ubi.mtd=ubi rootfstype=squashfs";
+		bootargs-find = "boot_from=B";
+		bootargs-replace = "ubi.block=0,rootfs2 root=/dev/ubiblock0_4";
 	};
 
 	memory@40000000 {

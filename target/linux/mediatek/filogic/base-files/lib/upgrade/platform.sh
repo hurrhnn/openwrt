@@ -136,6 +136,14 @@ platform_do_upgrade() {
 		CI_UBIPART="ubi"
 		nand_do_upgrade "$1"
 		;;
+	iptime,ax3000m)
+		CI_KERNPART="kernel"
+		CI_ROOTPART="rootfs"
+		[ "$(fw_printenv -n boot_from)" = "B" ] && \
+			CI_KERNPART="$CI_KERNPART"2 \
+			CI_ROOTPART="$CI_ROOTPART"2
+		nand_do_upgrade "$1"
+		;;
 	cudy,re3000-v1|\
 	cudy,wr3000-v1|\
 	yuncore,ax835|\

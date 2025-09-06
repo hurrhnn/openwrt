@@ -122,6 +122,14 @@ define Build/cetron-header
 	rm $@.tmp
 endef
 
+define Build/iptime-sysupgrade-control
+  ( \
+	sed -i 's/BOARD=$(DEVICE_NAME)/BOARD=$(1)/' $@; \
+	cat $@; \
+  ) > $@.new
+  mv $@.new $@
+endef
+
 define Device/abt_asr3000
   DEVICE_VENDOR := ABT
   DEVICE_MODEL := ASR3000
@@ -1286,7 +1294,8 @@ define Device/iptime_ax3000m
   KERNEL_INITRAMFS := kernel-bin | lzma | \
         fit lzma $$(KDIR)/image-$$(firstword $$(DEVICE_DTS)).dtb with-initrd | pad-to 64k
   IMAGES := factory.bin sysupgrade.bin
-  IMAGE/factory.bin := sysupgrade-tar | append-metadata | check-size | iptime-crc32 ax3000m
+  IMAGE/factory.bin := sysupgrade-tar | iptime-sysupgrade-control mt7891-AX3000 | \
+					   append-metadata | check-size | iptime-crc32 ax3000m
   IMAGE/sysupgrade.bin := sysupgrade-tar | append-metadata
   DEVICE_PACKAGES := kmod-mt7915e kmod-mt7981-firmware mt7981-wo-firmware
   SUPPORTED_DEVICES += mediatek,mt7981-spim-snand-rfb
