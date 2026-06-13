@@ -102,8 +102,17 @@ define Device/gemtek_w1700k-ubi
        with the vendor bootloader with regard to the BMT/BBT partition at \
        the end of flash. A reinstall including corrected chainloader is needed.
   DEVICE_PACKAGES := airoha-en7581-mt7996-npu-firmware fitblk kmod-i2c-an7581 \
-		    kmod-hwmon-nct7802 kmod-mt7996-firmware kmod-phy-rtl8261ce \
-		    wpad-basic-mbedtls rtl8261n-firmware
+		    kmod-hwmon-nct7802 kmod-mt7996-firmware kmod-phy-rtl8261ce wpad-basic-mbedtls
+  ifeq ($(DUMP),1)
+    # HACK adds: both packages to build the config dependency tree
+    DEVICE_PACKAGES += rtl8261n-firmware kmod-phy-rtl8261n
+  else
+    ifeq ($(KERNEL_PATCHVER),6.18)
+      DEVICE_PACKAGES += rtl8261n-firmware
+    else
+      DEVICE_PACKAGES += kmod-phy-rtl8261n
+    endif
+  endif
   UBINIZE_OPTS := -E 5
   BLOCKSIZE := 128k
   PAGESIZE := 2048
