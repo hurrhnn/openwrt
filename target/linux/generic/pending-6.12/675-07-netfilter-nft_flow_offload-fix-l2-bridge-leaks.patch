@@ -9,7 +9,7 @@ Signed-off-by: OpenWrt <openwrt@openwrt.org>
 ---
 --- a/net/netfilter/nft_flow_offload.c
 +++ b/net/netfilter/nft_flow_offload.c
-@@ -78,10 +78,13 @@ static bool nft_flow_offload_is_bridging
+@@ -84,10 +84,13 @@ static bool nft_flow_offload_is_bridging
  	rcu_read_lock();
  	port = br_port_get_rcu(skb->dev);
  	if (port) {

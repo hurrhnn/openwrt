@@ -607,7 +607,7 @@ Signed-off-by: Daniel Golle <daniel@makrotopia.org>
  void mtk_eth_set_dma_device(struct mtk_eth *eth, struct device *dma_dev)
  {
  	struct net_device *dev, *tmp;
-@@ -5185,7 +5398,8 @@ static int mtk_probe(struct platform_dev
+@@ -5182,7 +5395,8 @@ static int mtk_probe(struct platform_dev
  			regmap_write(cci, 0, 3);
  	}
  
@@ -617,7 +617,7 @@ Signed-off-by: Daniel Golle <daniel@makrotopia.org>
  		err = mtk_sgmii_init(eth);
  
  		if (err)
-@@ -5296,6 +5510,24 @@ static int mtk_probe(struct platform_dev
+@@ -5293,6 +5507,24 @@ static int mtk_probe(struct platform_dev
  		}
  	}
  
@@ -642,7 +642,7 @@ Signed-off-by: Daniel Golle <daniel@makrotopia.org>
  	if (MTK_HAS_CAPS(eth->soc->caps, MTK_SHARED_INT)) {
  		err = devm_request_irq(eth->dev, eth->irq[0],
  				       mtk_handle_irq, 0,
-@@ -5406,6 +5638,11 @@ static void mtk_remove(struct platform_d
+@@ -5403,6 +5635,11 @@ static void mtk_remove(struct platform_d
  		mtk_stop(eth->netdev[i]);
  		mac = netdev_priv(eth->netdev[i]);
  		phylink_disconnect_phy(mac->phylink);

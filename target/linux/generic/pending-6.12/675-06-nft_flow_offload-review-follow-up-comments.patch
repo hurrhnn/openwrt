@@ -13,7 +13,7 @@ Signed-off-by: OpenWrt <openwrt@openwrt.org>
 
 --- a/net/netfilter/nft_flow_offload.c
 +++ b/net/netfilter/nft_flow_offload.c
-@@ -107,6 +107,9 @@
+@@ -110,6 +110,9 @@ static int nft_dev_fill_forward_path(str
  	if (!nft_is_valid_ether_device(dev))
  		goto out;
  
@@ -23,7 +23,7 @@ Signed-off-by: OpenWrt <openwrt@openwrt.org>
  	if (!is_zero_ether_addr(ha))
  		goto out;
  
-@@ -239,8 +242,11 @@
+@@ -246,8 +249,11 @@ static void nft_dev_path_info(const stru
  				info->num_encaps++;
  				break;
  			case DEV_PATH_BR_VLAN_UNTAG:
@@ -36,7 +36,7 @@ Signed-off-by: OpenWrt <openwrt@openwrt.org>
  				break;
  			case DEV_PATH_BR_VLAN_KEEP:
  				break;
-@@ -361,6 +367,7 @@
+@@ -367,6 +373,7 @@ static int nft_flow_route_routing(const
  		fl.u.ip4.saddr = ct->tuplehash[!dir].tuple.src.u3.ip;
  		fl.u.ip4.flowi4_oif = nft_in(pkt)->ifindex;
  		fl.u.ip4.flowi4_iif = this_dst->dev->ifindex;

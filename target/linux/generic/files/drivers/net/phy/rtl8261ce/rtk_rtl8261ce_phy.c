@@ -215,7 +215,7 @@ static int rtl8261ce_hwmon_init(struct phy_device *phydev)
 	phy_clear_bits_mmd(phydev, MDIO_MMD_VEND2, RTL8261CE_VND2_TSALRM,
 			   RTL8261CE_THERMAL_ALARM_MASK);
 
-	hwdev = devm_hwmon_device_register_with_info(dev, NULL, phydev,
+	hwdev = devm_hwmon_device_register_with_info(dev, "RTL8261CE", phydev,
 						     &rtl8261ce_hwmon_chip_info,
 						     NULL);
 	return PTR_ERR_OR_ZERO(hwdev);

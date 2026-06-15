@@ -31,7 +31,7 @@ Signed-off-by: Daniel Golle <daniel@makrotopia.org>
  M:	Daniel Golle <daniel@makrotopia.org>
 --- a/drivers/net/pcs/Kconfig
 +++ b/drivers/net/pcs/Kconfig
-@@ -25,6 +25,17 @@ config PCS_MTK_LYNXI
+@@ -26,6 +26,17 @@ config PCS_MTK_LYNXI
  	  This module provides helpers to phylink for managing the LynxI PCS
  	  which is part of MediaTek's SoC and Ethernet switch ICs.
  

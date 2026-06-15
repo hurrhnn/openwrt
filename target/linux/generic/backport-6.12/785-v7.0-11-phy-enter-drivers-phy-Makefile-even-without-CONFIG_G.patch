@@ -41,9 +41,10 @@ Signed-off-by: Vinod Koul <vkoul@kernel.org>
  obj-$(CONFIG_PINCTRL)		+= pinctrl/
 --- a/drivers/phy/Makefile
 +++ b/drivers/phy/Makefile
-@@ -15,7 +15,7 @@ obj-$(CONFIG_PHY_SNPS_EUSB2)		+= phy-snp
+@@ -13,7 +13,7 @@ obj-$(CONFIG_PHY_XGENE)			+= phy-xgene.o
+ obj-$(CONFIG_PHY_PISTACHIO_USB)		+= phy-pistachio-usb.o
  obj-$(CONFIG_USB_LGM_PHY)		+= phy-lgm-usb.o
- obj-$(CONFIG_PHY_NXP_PTN3222)		+= phy-nxp-ptn3222.o
+ obj-$(CONFIG_PHY_AIROHA_PCIE)		+= phy-airoha-pcie.o
 -obj-y					+= allwinner/	\
 +obj-$(CONFIG_GENERIC_PHY)		+= allwinner/	\
  					   amlogic/	\

@@ -17,7 +17,7 @@ Signed-off-by: Ryan Chen <rchen14b@gmail.com>
 
 --- a/net/netfilter/nft_flow_offload.c
 +++ b/net/netfilter/nft_flow_offload.c
-@@ -222,6 +222,10 @@ static void nft_dev_path_info(const stru
+@@ -228,6 +228,10 @@ static void nft_dev_path_info(const stru
  			}
  			info->xmit_type = FLOW_OFFLOAD_XMIT_DIRECT;
  			break;

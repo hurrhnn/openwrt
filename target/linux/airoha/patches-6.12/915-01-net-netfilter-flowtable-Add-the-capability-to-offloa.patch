@@ -108,9 +108,9 @@ Signed-off-by: Lorenzo Bianconi <lorenzo@kernel.org>
  #include <linux/netfilter/nf_tables.h>
 +#include <net/dsfield.h>
  #include <net/ip.h> /* for ipv4 options. */
- #include <net/inet_dscp.h>
- #include <net/netfilter/nf_tables.h>
-@@ -279,6 +280,27 @@ static int nft_flow_route(const struct n
+ #include <net/route.h>
+ #include <net/ip6_route.h>
+@@ -484,6 +485,27 @@ nft_flow_route_bridging(const struct nft
  	return 0;
  }
  
@@ -138,7 +138,7 @@ Signed-off-by: Lorenzo Bianconi <lorenzo@kernel.org>
  static bool nft_flow_offload_skip(struct sk_buff *skb, int family)
  {
  	if (skb_sec_path(skb))
-@@ -371,6 +393,9 @@ static void nft_flow_offload_eval(const
+@@ -581,6 +603,9 @@ static void nft_flow_offload_eval(const
  	if (!flow)
  		goto err_flow_alloc;
  
