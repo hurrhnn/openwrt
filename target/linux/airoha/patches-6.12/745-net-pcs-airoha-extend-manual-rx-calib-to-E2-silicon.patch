@@ -27,9 +27,9 @@ Signed-off-by: Gilly <gilroyscott1970@gmail.com>
 +	 * manual rx calibration is needed. Extend the manual-calibration
 +	 * threshold to include E2 silicon.
  	 */
- 	if (device_is_compatible(dev, "airoha,an7581-pcs-eth")) {
- 		u32 val;
-@@ -1321,7 +1321,7 @@ static int airoha_pcs_probe(struct platf
+ 	if (device_is_compatible(dev, "airoha,an7581-pcs-eth") ||
+ 			device_is_compatible(dev, "airoha,an7581-pcs-pon")) {
+@@ -1322,7 +1322,7 @@ static int airoha_pcs_probe(struct platf
  		if (ret)
  			return ret;
  
