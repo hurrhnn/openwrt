@@ -1,0 +1,367 @@
+From: Rhnn Hur <hurrhnn@icmp.kr>
+Date: Sun, 08 Nov 2026 15:51:55 +0900
+Subject: [PATCH] wifi: mt76: mt7996: add MLO debug counters and an optional
+ event log
+
+Debugging MLO on mt7996 is hard because the firmware decides most of what
+happens on air. Add a few counters and an opt-in log that made the issues
+on a Gemtek W1700K (AN7581 + MT7996, NPU offload) visible. Both run only
+while the module parameter mlo_debug is set (0644, default off), so the TX
+and TX-free paths pay a single test otherwise:
+
+- debugfs mt76/mlo_dbg:
+  - the link that tx_prepare_skb picked per TID (by the odd/even TID rule
+    and after mt7996_get_tx_wcid), and how many frames were 802.3
+  - the link of the wcid in each TX-free event of an MLO peer
+  - per TID: calls of mt7996_tx_check_aggr, frames that are not QoS data,
+    ampdu_state already set, and the result of
+    ieee80211_start_tx_ba_session (last error)
+  - per MLO peer link: wcid, link id, phy, link_valid, deflink/seclink,
+    PEER_MLD links, MLD index, connection state, ampdu_state, BA masks
+  - writing anything resets the counters
+- mlo_debug also logs PEER_MLD, MLD_SETUP, change_sta_links, station
+  events and ampdu actions with dev_info and "mlo-dbg:" so they can be
+  lined up with the peer.
+
+No functional change.
+
+[Based on PR #1 of hurrhnn/openwrt by librehyangSu, rebased on mt76
+ 0936617d: count only while mlo_debug is set, and log the PEER_MLD second
+ link from a copy instead of the command skb, which is gone once it has
+ been sent.]
+---
+ mt7996/debugfs.c | 84 ++++++++++++++++++++++++++++++++++++++++++++++++
+ mt7996/mac.c     | 46 +++++++++++++++++++++++---
+ mt7996/main.c    | 14 ++++++++
+ mt7996/mcu.c     | 14 ++++++--
+ mt7996/mt7996.h  | 29 +++++++++++++++++
+ 5 files changed, 181 insertions(+), 6 deletions(-)
+
+diff --git a/mt7996/debugfs.c b/mt7996/debugfs.c
+index 404a9fe0..a4dda58a 100644
+--- a/mt7996/debugfs.c
++++ b/mt7996/debugfs.c
+@@ -1052,6 +1052,89 @@ static int mt7996_token_info_read(struct seq_file *s, void *data)
+ 	return 0;
+ }
+ 
++/* MLO debug (W1700K local): per-TID link counters and MLO station state */
++static int
++mt7996_mlo_dbg_show(struct seq_file *file, void *data)
++{
++	struct mt7996_dev *dev = file->private;
++	struct mt7996_mlo_dbg *d = &mt7996_mlo_dbg;
++	int tid, l, i;
++
++	seq_printf(file, "params: mlo_debug=%d (the counters run only while it is set)\n",
++		   mt7996_mlo_debug);
++	seq_puts(file, "TX link chosen (tx = by TID rule, final = wcid after get_tx_wcid), links 0..3\n");
++	seq_puts(file, "tid  tx[l0 l1 l2 l3]            final[l0 l1 l2 l3]         8023\n");
++	for (tid = 0; tid < IEEE80211_NUM_TIDS; tid++) {
++		seq_printf(file, "%u   ", tid);
++		for (l = 0; l < 4; l++)
++			seq_printf(file, " %u", d->tx[tid][l]);
++		seq_puts(file, "   |");
++		for (l = 0; l < 4; l++)
++			seq_printf(file, " %u", d->tx_final[tid][l]);
++		seq_printf(file, "   | %u\n", d->tx_8023[tid]);
++	}
++	seq_puts(file, "txfree wcid link (MLO sta):");
++	for (l = 0; l < 4; l++)
++		seq_printf(file, " l%d=%u", l, d->txfree_link[l]);
++	seq_printf(file, " no_link_sta=%u\n", d->txfree_no_link_sta);
++	seq_puts(file, "tx_check_aggr: tid call not_qos bit_set start_ok start_err last_err\n");
++	for (tid = 0; tid < IEEE80211_NUM_TIDS; tid++)
++		seq_printf(file, "  %u %u %u %u %u %u %d\n", tid,
++			   d->aggr_call[tid], d->aggr_not_qos[tid],
++			   d->aggr_bit_set[tid], d->aggr_start_ok[tid],
++			   d->aggr_start_err[tid], d->aggr_last_err[tid]);
++
++	seq_puts(file, "MLO stations: wcid link phy valid | sta def sec peer_mld mld_idx conn ampdu ba_tx ba_rx\n");
++	rcu_read_lock();
++	for (i = 0; i < ARRAY_SIZE(dev->mt76.wcid); i++) {
++		struct mt76_wcid *w = rcu_dereference(dev->mt76.wcid[i]);
++		struct mt7996_sta_link *msta_link;
++		struct ieee80211_sta *sta;
++		struct mt7996_sta *msta;
++
++		if (!w || !w->sta)
++			continue;
++		sta = wcid_to_sta(w);
++		if (!sta || !sta->mlo)
++			continue;
++		msta_link = container_of(w, struct mt7996_sta_link, wcid);
++		msta = msta_link->sta;
++		if (!msta)
++			continue;
++		seq_printf(file, "  %u %u %u %d | %pM %u %u 0x%x %u %u 0x%lx 0x%x 0x%x\n",
++			   w->idx, w->link_id, w->phy_idx, w->link_valid,
++			   sta->addr, msta->deflink_id, msta->seclink_id,
++			   msta->peer_mld_links, msta->fw_mld_idx,
++			   msta->conn_state, msta->deflink.wcid.ampdu_state,
++			   msta->ba_tx_mask, msta->ba_rx_mask);
++	}
++	rcu_read_unlock();
++
++	return 0;
++}
++
++static int
++mt7996_mlo_dbg_open(struct inode *inode, struct file *f)
++{
++	return single_open(f, mt7996_mlo_dbg_show, inode->i_private);
++}
++
++static ssize_t
++mt7996_mlo_dbg_write(struct file *f, const char __user *buf, size_t count,
++		     loff_t *ppos)
++{
++	memset(&mt7996_mlo_dbg, 0, sizeof(mt7996_mlo_dbg));
++	return count;
++}
++
++static const struct file_operations mt7996_mlo_dbg_fops = {
++	.open = mt7996_mlo_dbg_open,
++	.read = seq_read,
++	.write = mt7996_mlo_dbg_write,
++	.llseek = seq_lseek,
++	.release = single_release,
++};
++
+ int mt7996_init_debugfs(struct mt7996_dev *dev)
+ {
+ 	struct dentry *dir;
+@@ -1063,6 +1146,7 @@ int mt7996_init_debugfs(struct mt7996_dev *dev)
+ 	debugfs_create_file("xmit-queues", 0400, dir, dev,
+ 			    &mt7996_xmit_queues_fops);
+ 	debugfs_create_file("tx_stats", 0400, dir, dev, &mt7996_tx_stats_fops);
++	debugfs_create_file("mlo_dbg", 0600, dir, dev, &mt7996_mlo_dbg_fops);
+ 	debugfs_create_file("sys_recovery", 0600, dir, dev,
+ 			    &mt7996_sys_recovery_ops);
+ 	debugfs_create_file("fw_debug_wm", 0600, dir, dev, &fops_fw_debug_wm);
+diff --git a/mt7996/mac.c b/mt7996/mac.c
+index 2244194b..94c842a2 100644
+--- a/mt7996/mac.c
++++ b/mt7996/mac.c
+@@ -11,6 +11,11 @@
+ #include "mac.h"
+ #include "mcu.h"
+ 
++struct mt7996_mlo_dbg mt7996_mlo_dbg;
++bool mt7996_mlo_debug;
++module_param_named(mlo_debug, mt7996_mlo_debug, bool, 0644);
++MODULE_PARM_DESC(mlo_debug, "log MLO station/link/BA events");
++
+ #define to_rssi(field, rcpi)	((FIELD_GET(field, rcpi) - 220) / 2)
+ 
+ static struct mt76_wcid *mt7996_rx_get_wcid(struct mt7996_dev *dev,
+@@ -958,6 +963,10 @@ int mt7996_tx_prepare_skb(struct mt76_dev *mdev, void *txwi_ptr,
+ 		u8 tid = tx_info->skb->priority & IEEE80211_QOS_CTL_TID_MASK;
+ 
+ 		link_id = (tid % 2) ? msta->seclink_id : msta->deflink_id;
++		if (link_id < IEEE80211_MLD_MAX_NUM_LINKS)
++			mt7996_mlo_dbg_inc(tx[tid][link_id]);
++		if (is_8023)
++			mt7996_mlo_dbg_inc(tx_8023[tid]);
+ 	} else if (is_8023) {
+ 		/* mac80211 does not set the MLO link of an 802.3 frame */
+ 		link_id = IEEE80211_LINK_UNSPECIFIED;
+@@ -1028,6 +1037,9 @@ int mt7996_tx_prepare_skb(struct mt76_dev *mdev, void *txwi_ptr,
+ 	}
+ 
+ 	wcid = mt7996_get_tx_wcid(wcid);
++	if (sta && sta->mlo && wcid->link_id < IEEE80211_MLD_MAX_NUM_LINKS)
++		mt7996_mlo_dbg_inc(tx_final[tx_info->skb->priority &
++					    IEEE80211_QOS_CTL_TID_MASK][wcid->link_id]);
+ 
+ 	/* mt76_tx_status_skb_add() clears info->control.flags */
+ 	host_txd = !is_8023 ||
+@@ -1156,6 +1168,7 @@ mt7996_tx_check_aggr(struct ieee80211_link_sta *link_sta,
+ 	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
+ 	bool is_8023 = info->flags & IEEE80211_TX_CTL_HW_80211_ENCAP;
+ 	u16 fc, tid;
++	int ret;
+ 
+ 	if (!(link_sta->ht_cap.ht_supported || link_sta->he_cap.has_he))
+ 		return;
+@@ -1178,12 +1191,31 @@ mt7996_tx_check_aggr(struct ieee80211_link_sta *link_sta,
+ 		     (IEEE80211_FCTL_FTYPE | IEEE80211_FCTL_STYPE);
+ 	}
+ 
+-	if (unlikely(fc != (IEEE80211_FTYPE_DATA | IEEE80211_STYPE_QOS_DATA)))
++	mt7996_mlo_dbg_inc(aggr_call[tid]);
++	if (unlikely(fc != (IEEE80211_FTYPE_DATA | IEEE80211_STYPE_QOS_DATA))) {
++		mt7996_mlo_dbg_inc(aggr_not_qos[tid]);
++		return;
++	}
++
++	if (test_and_set_bit(tid, &wcid->ampdu_state)) {
++		mt7996_mlo_dbg_inc(aggr_bit_set[tid]);
++		return;
++	}
++
++	ret = ieee80211_start_tx_ba_session(link_sta->sta, tid, 0);
++	if (!ret) {
++		mt7996_mlo_dbg_inc(aggr_start_ok[tid]);
+ 		return;
++	}
+ 
+-	if (!test_and_set_bit(tid, &wcid->ampdu_state) &&
+-	    ieee80211_start_tx_ba_session(link_sta->sta, tid, 0))
+-		clear_bit(tid, &wcid->ampdu_state);
++	clear_bit(tid, &wcid->ampdu_state);
++	if (unlikely(mt7996_mlo_debug)) {
++		mt7996_mlo_dbg.aggr_start_err[tid]++;
++		mt7996_mlo_dbg.aggr_last_err[tid] = ret;
++		pr_info_ratelimited("mt7996e mlo-dbg: start_tx_ba %pM tid %u link %u ret %d\n",
++				    link_sta->sta->addr, tid, link_sta->link_id,
++				    ret);
++	}
+ }
+ 
+ /* mt7996/mt7992 provide a HW MAC-TXP for AddBA req frames (MT_TXD7_MAC_TXD),
+@@ -1307,6 +1339,12 @@ mt7996_mac_tx_free(struct mt7996_dev *dev, void *data, int len)
+ 			}
+ 
+ 			link_sta = rcu_dereference(sta->link[wcid->link_id]);
++			if (unlikely(mt7996_mlo_debug) && sta->mlo) {
++				if (!link_sta)
++					mt7996_mlo_dbg.txfree_no_link_sta++;
++				else if (wcid->link_id < IEEE80211_MLD_MAX_NUM_LINKS)
++					mt7996_mlo_dbg.txfree_link[wcid->link_id]++;
++			}
+ 			if (!link_sta)
+ 				goto next;
+ next:
+diff --git a/mt7996/main.c b/mt7996/main.c
+index 7eb81996..dbb8bc26 100644
+--- a/mt7996/main.c
++++ b/mt7996/main.c
+@@ -1732,6 +1732,11 @@ mt7996_mac_sta_event(struct mt7996_dev *dev, struct ieee80211_vif *vif,
+ 
+ 	mutex_lock(&dev->mt76.mutex);
+ 
++	mt7996_mlo_dbg_log(dev, "sta_event %pM ev %d mlo %d links 0x%lx def %u sec %u\n",
++			   sta->addr, ev, sta->mlo,
++			   (unsigned long)mt7996_mac_sta_links(dev, vif, sta),
++			   msta->deflink_id, msta->seclink_id);
++
+ 	if (ev == MT76_STA_EVENT_ASSOC && sta->mlo) {
+ 		err = mt7996_mcu_set_peer_mld(dev, vif, sta);
+ 		if (err)
+@@ -2029,6 +2034,7 @@ mt7996_mac_sta_change_links(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+ 			    struct ieee80211_sta *sta, u16 old_links,
+ 			    u16 new_links)
+ {
++	struct mt7996_sta *msta = (struct mt7996_sta *)sta->drv_priv;
+ 	struct mt7996_dev *dev = mt7996_hw_dev(hw);
+ 	unsigned long add = new_links & ~old_links;
+ 	unsigned long rem = old_links & ~new_links;
+@@ -2051,6 +2057,11 @@ mt7996_mac_sta_change_links(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+ 	}
+ 
+ out:
++	mt7996_mlo_dbg_log(dev, "change_links %pM old 0x%x new 0x%x ret %d def %u sec %u peer_mld 0x%lx conn %d\n",
++			   sta->addr, old_links, new_links, ret,
++			   msta->deflink_id, msta->seclink_id,
++			   (unsigned long)msta->peer_mld_links,
++			   msta->conn_state);
+ 	mutex_unlock(&dev->mt76.mutex);
+ 
+ 	return ret;
+@@ -2308,6 +2319,9 @@ mt7996_ampdu_action(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+ 
+ 	links = mt7996_mac_sta_links(dev, vif, sta);
+ 
++	mt7996_mlo_dbg_log(dev, "ampdu %pM action %d tid %u ssn %u links 0x%lx\n",
++			   sta->addr, params->action, tid, ssn, links);
++
+ 	switch (params->action) {
+ 	case IEEE80211_AMPDU_RX_START:
+ 		/* Since packets belonging to the same TID can be split over
+diff --git a/mt7996/mcu.c b/mt7996/mcu.c
+index 7eb19275..70104a7f 100644
+--- a/mt7996/mcu.c
++++ b/mt7996/mcu.c
+@@ -3352,6 +3352,12 @@ mt7996_mcu_sta_mld_setup_tlv(struct mt7996_dev *dev, struct sk_buff *skb,
+ 	/* PEER_MLD_INFO holds only the links of the association */
+ 	if (links == msta->peer_mld_links)
+ 		mld_setup->extra_info = EXTRA_INFO_MLD_SKIP;
++	mt7996_mlo_dbg_log(dev, "MLD_SETUP %pM links 0x%lx setup %u primary %u second %u extra 0x%x peer_mld 0x%lx\n",
++			   sta->addr, links, le16_to_cpu(mld_setup->setup_wcid),
++			   le16_to_cpu(mld_setup->primary_id),
++			   le16_to_cpu(mld_setup->seconed_id),
++			   mld_setup->extra_info,
++			   (unsigned long)msta->peer_mld_links);
+ 
+ 	mld_setup_link = (struct mld_setup_link *)mld_setup->link_info;
+ 	for_each_set_bit(link_id, &links, IEEE80211_MLD_MAX_NUM_LINKS) {
+@@ -3396,7 +3402,7 @@ int mt7996_mcu_set_peer_mld(struct mt7996_dev *dev, struct ieee80211_vif *vif,
+ 	unsigned int link_id;
+ 	struct sk_buff *skb;
+ 	struct tlv *tlv;
+-	u16 fw_mld_idx;
++	u16 fw_mld_idx, second_id;
+ 	int len, ret;
+ 
+ 	if (!(links & BIT(msta->deflink_id)))
+@@ -3426,7 +3432,8 @@ int mt7996_mcu_set_peer_mld(struct mt7996_dev *dev, struct ieee80211_vif *vif,
+ 	if (links & BIT(msta->seclink_id))
+ 		seclink_id = msta->seclink_id;
+ 	msta_link = mt7996_sta_link_protected(dev, msta, seclink_id);
+-	info->second_id = cpu_to_le16(msta_link->wcid.idx);
++	second_id = msta_link->wcid.idx;
++	info->second_id = cpu_to_le16(second_id);
+ 
+ 	link_info = info->link_info;
+ 	for_each_set_bit(link_id, &links, IEEE80211_MLD_MAX_NUM_LINKS) {
+@@ -3460,6 +3467,9 @@ int mt7996_mcu_set_peer_mld(struct mt7996_dev *dev, struct ieee80211_vif *vif,
+ 
+ 	ret = mt76_mcu_skb_send_msg(&dev->mt76, skb,
+ 				    MCU_WMWA_UNI_CMD(PEER_MLD), true);
++	/* the skb is gone once it has been sent */
++	mt7996_mlo_dbg_log(dev, "PEER_MLD %pM links 0x%lx mld_idx %u second %u ret %d\n",
++			   sta->addr, links, fw_mld_idx, second_id, ret);
+ 	if (!ret) {
+ 		msta->peer_mld_links = links;
+ 		msta->fw_mld_idx = fw_mld_idx;
+diff --git a/mt7996/mt7996.h b/mt7996/mt7996.h
+index aabd9d2b..de8add31 100644
+--- a/mt7996/mt7996.h
++++ b/mt7996/mt7996.h
+@@ -352,6 +352,35 @@ struct mt7996_vif_link_info {
+ 	struct ieee80211_tx_queue_params queue_params[IEEE80211_NUM_ACS];
+ };
+ 
++/* MLO debug (W1700K local), counted only while mlo_debug is set */
++struct mt7996_mlo_dbg {
++	u32 tx[IEEE80211_NUM_TIDS][IEEE80211_MLD_MAX_NUM_LINKS];
++	u32 tx_final[IEEE80211_NUM_TIDS][IEEE80211_MLD_MAX_NUM_LINKS];
++	u32 tx_8023[IEEE80211_NUM_TIDS];
++	u32 txfree_link[IEEE80211_MLD_MAX_NUM_LINKS];
++	u32 txfree_no_link_sta;
++	u32 aggr_call[IEEE80211_NUM_TIDS];
++	u32 aggr_not_qos[IEEE80211_NUM_TIDS];
++	u32 aggr_bit_set[IEEE80211_NUM_TIDS];
++	u32 aggr_start_ok[IEEE80211_NUM_TIDS];
++	u32 aggr_start_err[IEEE80211_NUM_TIDS];
++	int aggr_last_err[IEEE80211_NUM_TIDS];
++};
++
++extern struct mt7996_mlo_dbg mt7996_mlo_dbg;
++extern bool mt7996_mlo_debug;
++#define mt7996_mlo_dbg_inc(_field)					\
++	do {								\
++		if (unlikely(mt7996_mlo_debug))				\
++			mt7996_mlo_dbg._field++;			\
++	} while (0)
++#define mt7996_mlo_dbg_log(_dev, _fmt, ...)				\
++	do {								\
++		if (mt7996_mlo_debug)					\
++			dev_info((_dev)->mt76.dev, "mlo-dbg: " _fmt,	\
++				 ##__VA_ARGS__);			\
++	} while (0)
++
+ struct mt7996_vif {
+ 	struct mt7996_vif_link deflink; /* must be first */
+ 	struct mt76_vif_data mt76;

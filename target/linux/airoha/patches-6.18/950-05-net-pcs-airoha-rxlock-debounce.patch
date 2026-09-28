@@ -1,0 +1,27 @@
+From: hurrhnn <hurrhnn@icmp.kr>
+Date: Sat, 19 Sep 2026 00:30:00 +0900
+Subject: [PATCH] net: pcs: airoha: debounce the rxlock workaround
+
+The rxlock workaround fires a destructive CDR reset off a single
+instantaneous PCS status read, although the SigDet scan that precedes
+the reset takes a while and the RX may have recovered on its own in the
+meantime.
+
+Re-read the PCS status after the SigDet scan and skip the CDR reset if
+the RX link is up again.
+
+Signed-off-by: hurrhnn <hurrhnn@icmp.kr>
+---
+--- a/drivers/net/pcs/airoha/pcs-an7581.c
++++ b/drivers/net/pcs/airoha/pcs-an7581.c
+@@ -2081,6 +2081,10 @@
+ 	if (!an7581_pcs_have_rx_signal(priv, index))
+ 		return 0;
+
++	regmap_read(maps->usxgmii_pcs, AIROHA_PCS_USXGMII_PCS_STUS_1, &val);
++	if (val & AIROHA_PCS_USXGMII_PCS_RX_LINK_STATUS_UP)
++		return 0;
++
+ 	/* If PCS is down but RX SigDet module detected signal,
+ 	 * trigger CDR reset.
+ 	 */

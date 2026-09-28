@@ -1,0 +1,117 @@
+From: Paul-Louis Charrière <plcharriere@gmail.com>
+Date: Mon, 26 Oct 2026 12:56:51 +0900
+Subject: [PATCH] netfilter: flowtable: remove hardware flows before
+ unbinding
+
+Since commit 13210fc63f35 ("netfilter: nf_tables: imbalance in flowtable
+binding"), FLOW_BLOCK_UNBIND is called when the flowtable hooks are
+unregistered, in the commit phase, and nf_flow_table_free() only tears
+the flows down later.  Their FLOW_CLS_DESTROY requests then find no
+block callback, so the rules stay in hardware: the flows keep being
+forwarded, and drivers such as mtk_eth_soc and mlx5 keep their entries
+and reject a later flow with the same cookie with -EEXIST.
+Commit 5acab91458ce ("netfilter: nf_tables: unbind callbacks from
+flowtable destroy path") had placed the unbind after nf_flow_table_free()
+for this reason.
+
+Remove the flows of the device from the hardware in
+nf_flow_table_offload_setup() before unbinding it, as
+nf_flow_table_indr_cleanup() does for indirect blocks.  The GC run that
+nf_flow_table_gc_cleanup() waits for may skip flows with pending offload
+work, or have started before the teardown, so queue the GC work once
+more, wait for it and flush the delete work again.  A direct
+nf_flow_table_gc_run() would race with the GC worker.  No BIND or
+UNBIND call is added.
+
+Found on a router with mtk_eth_soc flow offloading, where each firewall
+reload left the flows of the old flowtable bound in the PPE.  Jalen
+reproduced it on mainline with mtk_eth_soc and mlx5 and tested this
+change on both, see the report.  Build-tested with W=1 and sparse on
+arm64 and x86_64.  In an arm64 guest with lockdep and KASAN, with TCP
+flows through an offload flowtable on netdevsim ports, the delete work
+of a deleted flowtable now runs before FLOW_BLOCK_UNBIND returns instead
+of after it, and nft_offload.sh passes.
+
+Fixes: 13210fc63f35 ("netfilter: nf_tables: imbalance in flowtable binding")
+Reported-by: Jalen <jalen.lin@gmail.com>
+Closes: https://lore.kernel.org/netfilter-devel/CAHqkChbVoGHrWtaFyGFaLQDiAunWw1qOpW-vKSgkKxWEfQ_tCg@mail.gmail.com/
+Cc: stable@vger.kernel.org
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+Link: https://patchwork.ozlabs.org/project/netfilter-devel/patch/20261026035651.40052-1-plcharriere@gmail.com/
+[ OpenWrt local hunk, not part of v1: a comment in
+  nf_tables_flowtable_destroy(), see below. ]
+---
+Pending upstream: nf pw 2328048 / netdev pw 14914054 (v1, 2026-10-26),
+not in nf.git, net, mainline or 6.18.y as of 2026-11-04. Other fixes
+posted for the same regression: "netfilter: flowtable: perform unbind
+callback on hook release" (nf pw 2329737) and "netfilter: flowtable:
+remove hw flows before unbinding the flow block" (nf pw 2335780). Drop
+or replace this file in the first resync that has any fix for
+13210fc63f35 in 6.18.y or in OpenWrt.
+
+Never stack it with nf pw 2329737 or another fix that moves the unbind
+after nf_flow_table_free(): the cleanup added here would then walk the
+destroyed flow table and re-arm the cancelled gc_work of a flowtable
+that is freed right after. Those fixes change nf_tables_api.c, not
+nf_flow_table_offload.c, so the local comment hunk sits where they have
+to change nf_tables_flowtable_destroy() and makes this patch fail to
+apply. Both hunks carry 5 lines of context so that a fix block already
+added at the same place in nf_flow_table_offload_setup() (nf pw 2328048
+itself or nf pw 2335780) makes them fail instead of applying with fuzz
+2; refresh this file with -U5.
+
+Flows of the old flowtable can now be torn down twice (by the cleanup
+of a later device and by nf_flow_table_free()); airoha
+9999-9d-netfilter-flowtable-clear-IPS_OFFLOAD-only-on-first-teardown
+keeps the second teardown from clearing IPS_OFFLOAD.
+
+ net/netfilter/nf_flow_table_offload.c |   13 +++++++++++++
+ net/netfilter/nf_tables_api.c         |    6 ++++++
+ 2 files changed, 19 insertions(+)
+
+--- a/net/netfilter/nf_flow_table_offload.c
++++ b/net/netfilter/nf_flow_table_offload.c
+@@ -1273,10 +1273,23 @@ int nf_flow_table_offload_setup(struct n
+ 	int err;
+ 
+ 	if (!nf_flowtable_hw_offload(flowtable))
+ 		return nf_flow_offload_xdp_setup(flowtable, dev, cmd);
+ 
++	/* Hardware rules are deleted through the block callbacks, so delete
++	 * the rules of this device's flows before unbinding it.  Run the GC
++	 * twice: the first run may skip flows with pending offload work, or
++	 * have started before the teardown.
++	 */
++	if (cmd == FLOW_BLOCK_UNBIND) {
++		nf_flow_table_gc_cleanup(flowtable, dev);
++		mod_delayed_work(system_power_efficient_wq,
++				 &flowtable->gc_work, 0);
++		flush_delayed_work(&flowtable->gc_work);
++		flush_workqueue(nf_flow_offload_del_wq);
++	}
++
+ 	if (dev->netdev_ops->ndo_setup_tc)
+ 		err = nf_flow_table_offload_cmd(&bo, flowtable, dev, cmd,
+ 						&extack);
+ 	else
+ 		err = nf_flow_table_indr_offload_cmd(&bo, flowtable, dev, cmd,
+--- a/net/netfilter/nf_tables_api.c
++++ b/net/netfilter/nf_tables_api.c
+@@ -9689,10 +9689,16 @@ err:
+ }
+ 
+ static void nf_tables_flowtable_destroy(struct nft_flowtable *flowtable)
+ {
+ 	flowtable->data.type->free(&flowtable->data);
++	/* OpenWrt (local): the hooks were unbound in the commit phase, after
++	 * nf_flow_table_offload_setup() removed their hardware flows. An
++	 * unbind after ->free() would make that removal walk the destroyed
++	 * flow table, so this comment keeps the patch from applying on top
++	 * of a fix that unbinds here.
++	 */
+ 	nft_hooks_destroy(&flowtable->hook_list);
+ 	kfree(flowtable->name);
+ 	module_put(flowtable->data.type->owner);
+ 	kfree(flowtable);
+ }

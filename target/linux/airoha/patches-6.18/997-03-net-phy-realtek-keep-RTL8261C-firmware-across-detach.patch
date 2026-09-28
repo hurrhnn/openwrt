@@ -1,0 +1,40 @@
+From: hurrhnn <hurrhnn@icmp.kr>
+Date: Sat, 27 Sep 2026 15:10:00 +0900
+Subject: [PATCH] net: phy: realtek: keep RTL8261C/CE firmware across detach
+
+rtl8261x_config_init() loads the PHY firmware once and latches
+priv->fw_loaded. As its own comment notes, the firmware survives IEEE
+soft resets and suspend/resume, but not a hard reset.
+
+phy_detach() asserts the PHY reset GPIO unless the driver sets
+PHY_DETACH_NO_HW_RESET. On boards that wire reset-gpios to the PHY every
+ndo_stop -> phylink_disconnect_phy() therefore wipes the firmware, while
+fw_loaded stays true. The next ndo_open runs config_init again, skips
+the load and leaves the PHY running without its patch after a plain
+ifdown/ifup or network restart.
+
+Set PHY_DETACH_NO_HW_RESET on both RTL8261C/D and RTL8261CE entries,
+the same approach as21xxx takes for its firmware-loaded PHYs.
+phy_detach() still calls phy_suspend(), so the link still goes down
+while the interface is closed.
+
+Signed-off-by: hurrhnn <hurrhnn@icmp.kr>
+---
+--- a/drivers/net/phy/realtek/realtek_main.c
++++ b/drivers/net/phy/realtek/realtek_main.c
+@@ -4128,6 +4128,7 @@
+ 	}, {
+ 		PHY_ID_MATCH_EXACT(RTL_8261C_CG),
+ 		.name			= "Realtek RTL8261C/D 10Gbps PHY",
++		.flags			= PHY_DETACH_NO_HW_RESET,
+ 		.probe			= rtl8261x_probe,
+ 		.config_init		= rtl8261x_config_init,
+ 		.get_features		= rtl8261x_get_features,
+@@ -4146,6 +4147,7 @@
+ 	}, {
+ 		PHY_ID_MATCH_EXACT(RTL_8261CE_CG),
+ 		.name			= "Realtek RTL8261CE 10Gbps PHY",
++		.flags			= PHY_DETACH_NO_HW_RESET,
+ 		.probe			= rtl8261x_probe,
+ 		.config_init		= rtl8261x_config_init,
+ 		.get_features		= rtl8261x_get_features,

@@ -1,4 +1,4 @@
-From b7ba96ac12322a5c413311486902617d9433cf93 Mon Sep 17 00:00:00 2001
+From ac6025d5d225345d5890ccfe4325d1c769d82b34 Mon Sep 17 00:00:00 2001
 From: Yanghan Ye <yyh94306@gmail.com>
 Date: Wed, 24 Jun 2026 20:19:12 +0800
 Subject: [PATCH] wifi: mt76: mt7996: enable firmware txpower limit controls
@@ -18,19 +18,24 @@ mt7996_mcu_set_tx_power_ctrl, so those parts are dropped here to avoid
 duplicate definitions. Only UNI_TXPOWER_SHOW_INFO is added to mcu.h.
 
 Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+[hurrhnn: refreshed for mt76 2026.11.19 (22f7ff9b): mt7996_mcu_set_txpower_sku()
+ starts from the channel max power, bounded by the BSS TX power once a BSS
+ sets it, as upstream 9b06eef0 does]
+Signed-off-by: hurrhnn <hurrhnn@icmp.kr>
 ---
  eeprom.c        |   9 ++
  mt7996/init.c   |  16 ++-
  mt7996/main.c   |  10 ++
- mt7996/mcu.c    | 329 ++++++++++++++++++++++++++++++++++++++++++++++++++++----
+ mt7996/mcu.c    | 329 +++++++++++++++++++++++++++++++++++++++++++++---
  mt7996/mcu.h    |   1 +
  mt7996/mt7996.h |   4 +
  6 files changed, 349 insertions(+), 20 deletions(-)
 
 diff --git a/eeprom.c b/eeprom.c
+index 254d252b..9a37d9c1 100644
 --- a/eeprom.c
 +++ b/eeprom.c
-@@ -516,6 +516,15 @@
+@@ -516,6 +516,15 @@ s8 mt76_get_rate_power_limits(struct mt76_phy *phy,
  				     ARRAY_SIZE(dest->ru), val, len, target_power,
  				     txs_delta, &max_power, n_chains, MT76_SKU_RATE);
  
@@ -47,9 +52,10 @@ diff --git a/eeprom.c b/eeprom.c
  	mt76_apply_array_limit(dev, dest->path.cck, ARRAY_SIZE(dest->path.cck), val,
  			       target_power, txs_delta, &max_power, n_chains, MT76_SKU_BACKOFF);
 diff --git a/mt7996/init.c b/mt7996/init.c
+index ab2de70f..d8a0722d 100644
 --- a/mt7996/init.c
 +++ b/mt7996/init.c
-@@ -362,15 +362,23 @@
+@@ -362,15 +362,23 @@ static void __mt7996_init_txpower(struct mt7996_phy *phy,
  	int i, n_chains = hweight16(phy->mt76->chainmask);
  	int path_delta = mt76_tx_power_path_delta(n_chains);
  	int pwr_delta = mt7996_eeprom_get_power_delta(dev, sband->band);
@@ -75,7 +81,7 @@ diff --git a/mt7996/init.c b/mt7996/init.c
  							  target_power);
  		target_power += path_delta;
  		target_power = DIV_ROUND_UP(target_power, 2);
-@@ -379,6 +387,8 @@
+@@ -379,6 +387,8 @@ static void __mt7996_init_txpower(struct mt7996_phy *phy,
  		phy->txpower = max(phy->txpower, chan->max_power);
  		chan->orig_mpwr = target_power;
  	}
@@ -84,7 +90,7 @@ diff --git a/mt7996/init.c b/mt7996/init.c
  }
  
  void mt7996_init_txpower(struct mt7996_phy *phy)
-@@ -386,6 +396,8 @@
+@@ -386,6 +396,8 @@ void mt7996_init_txpower(struct mt7996_phy *phy)
  	if (!phy)
  		return;
  
@@ -94,9 +100,10 @@ diff --git a/mt7996/init.c b/mt7996/init.c
  		__mt7996_init_txpower(phy, &phy->mt76->sband_2g.sband);
  	if (phy->mt76->cap.has_5ghz)
 diff --git a/mt7996/main.c b/mt7996/main.c
+index 5f87f518..b42b23c9 100644
 --- a/mt7996/main.c
 +++ b/mt7996/main.c
-@@ -39,6 +39,16 @@
+@@ -39,6 +39,16 @@ int mt7996_run(struct mt7996_phy *phy)
  	if (ret)
  		goto disable_radio;
  
@@ -114,6 +121,7 @@ diff --git a/mt7996/main.c b/mt7996/main.c
  
  	ieee80211_queue_delayed_work(dev->mphy.hw, &phy->mt76->mac_work,
 diff --git a/mt7996/mcu.c b/mt7996/mcu.c
+index 6d256a03..159ce16b 100644
 --- a/mt7996/mcu.c
 +++ b/mt7996/mcu.c
 @@ -5,6 +5,7 @@
@@ -124,7 +132,7 @@ diff --git a/mt7996/mcu.c b/mt7996/mcu.c
  #include "mt7996.h"
  #include "mcu.h"
  #include "mac.h"
-@@ -108,6 +109,242 @@
+@@ -108,6 +109,242 @@ static bool sr_scene_detect = true;
  module_param(sr_scene_detect, bool, 0644);
  MODULE_PARM_DESC(sr_scene_detect, "Enable firmware scene detection algorithm");
  
@@ -367,7 +375,7 @@ diff --git a/mt7996/mcu.c b/mt7996/mcu.c
  static u8
  mt7996_mcu_get_sta_nss(u16 mcs_map)
  {
-@@ -6169,6 +6406,7 @@
+@@ -6201,6 +6438,7 @@ int mt7996_mcu_set_tx_power_ctrl(struct mt7996_phy *phy, u8 power_ctrl_id, u8 da
  int mt7996_mcu_set_txpower_sku(struct mt7996_phy *phy)
  {
  #define TX_POWER_LIMIT_TABLE_RATE	0
@@ -375,7 +383,7 @@ diff --git a/mt7996/mcu.c b/mt7996/mcu.c
  	struct mt7996_dev *dev = phy->dev;
  	struct mt76_phy *mphy = phy->mt76;
  	struct tx_power_limit_table_ctrl {
-@@ -6186,45 +6424,100 @@
+@@ -6218,48 +6456,103 @@ int mt7996_mcu_set_txpower_sku(struct mt7996_phy *phy)
  		.power_limit_type = TX_POWER_LIMIT_TABLE_RATE,
  		.band_idx = phy->mt76->band_idx,
  	};
@@ -386,11 +394,14 @@ diff --git a/mt7996/mcu.c b/mt7996/mcu.c
 -	int i, tx_power;
 +	int i, ret, target_power, tx_power;
  
--	tx_power = mt76_get_power_bound(mphy, phy->txpower);
+ 	tx_power = mphy->chandef.chan->max_power;
+ 	if (phy->txpower != INT_MIN)
+ 		tx_power = min(tx_power, phy->txpower);
+-	tx_power = mt76_get_power_bound(mphy, tx_power);
 -	tx_power = mt76_get_rate_power_limits(mphy, mphy->chandef.chan,
 -					      &la, tx_power);
 -	mphy->txpower_cur = tx_power;
-+	target_power = mt76_get_power_bound(mphy, phy->txpower);
++	target_power = mt76_get_power_bound(mphy, tx_power);
 +	tx_power = target_power;
 +	if (phy->sku_limit_en) {
 +		la = kzalloc(sizeof(*la), GFP_KERNEL);
@@ -495,9 +506,10 @@ diff --git a/mt7996/mcu.c b/mt7996/mcu.c
  
  int mt7996_mcu_cp_support(struct mt7996_dev *dev, u8 mode)
 diff --git a/mt7996/mcu.h b/mt7996/mcu.h
+index 3ec2d99d..68fa96ac 100644
 --- a/mt7996/mcu.h
 +++ b/mt7996/mcu.h
-@@ -1155,6 +1155,7 @@
+@@ -1155,6 +1155,7 @@ enum {
  	UNI_TXPOWER_BACKOFF_POWER_LIMIT_CTRL = 3,
  	UNI_TXPOWER_POWER_LIMIT_TABLE_CTRL = 4,
  	UNI_TXPOWER_ATE_MODE_CTRL = 6,
@@ -506,9 +518,10 @@ diff --git a/mt7996/mcu.h b/mt7996/mcu.h
  
  enum {
 diff --git a/mt7996/mt7996.h b/mt7996/mt7996.h
+index d47dc25c..aabd9d2b 100644
 --- a/mt7996/mt7996.h
 +++ b/mt7996/mt7996.h
-@@ -468,6 +468,8 @@
+@@ -468,6 +468,8 @@ struct mt7996_phy {
  	bool counter_reset;
  	bool rdd_tx_paused;
  	bool offchan_bcn_stopped;
@@ -517,7 +530,7 @@ diff --git a/mt7996/mt7996.h b/mt7996/mt7996.h
  };
  
  struct mt7996_dev {
-@@ -885,6 +887,8 @@
+@@ -885,6 +887,8 @@ int mt7996_mcu_get_chan_mib_info(struct mt7996_phy *phy, bool chan_switch);
  int mt7996_mcu_get_temperature(struct mt7996_phy *phy);
  int mt7996_mcu_set_thermal_throttling(struct mt7996_phy *phy, u8 state);
  int mt7996_mcu_set_thermal_protect(struct mt7996_phy *phy, bool enable);

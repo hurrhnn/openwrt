@@ -1,0 +1,49 @@
+From 3d989d1f40a0b286342fab34ed791854c918d06b Mon Sep 17 00:00:00 2001
+From: Javen Xu <javen_xu@realsil.com.cn>
+Date: Fri, 11 Sep 2026 17:45:27 +0800
+Subject: [PATCH] net: phy: realtek: improve firmware write speed
+
+Firmware execution routine unconditionally uses phy_modify_mmd() for
+all OP_WRITE entries which introduces an unnecessary read transaction
+when updating an entire 16-bit register. So we optimize this by
+checking bitmask boundaries. Use phy_write_mmd() directly to speed up
+firmware loading process.
+
+Benchmark number from tracing MDC/MDIO hardware transactions during
+firmware loading process:
+ - Unpatched: about 28,000 MDIO transactions
+ - Patched: about 9,600 MDIO transactions
+This results in an approx 65% reduction in MDIO traffic.
+
+Signed-off-by: Javen Xu <javen_xu@realsil.com.cn>
+Reviewed-by: Nicolai Buchwitz <nb@tipi-net.de>
+Reviewed-by: Andrew Lunn <andrew@lunn.ch>
+Link: https://patch.msgid.link/20260911094527.1928-1-javen_xu@realsil.com.cn
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Rhnn Hur <hurrhnn@icmp.kr>
+---
+ drivers/net/phy/realtek/realtek_main.c | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/net/phy/realtek/realtek_main.c b/drivers/net/phy/realtek/realtek_main.c
+index 27e31a799e..97b0b67b99 100644
+--- a/drivers/net/phy/realtek/realtek_main.c
++++ b/drivers/net/phy/realtek/realtek_main.c
+@@ -548,8 +548,12 @@ static int rtl8261x_fw_execute_entry(struct phy_device *phydev,
+ 
+ 	switch (entry->type) {
+ 	case OP_WRITE:
+-		ret = phy_modify_mmd(phydev, dev, addr,
+-				     GENMASK(msb, lsb), (value << lsb) & GENMASK(msb, lsb));
++		if (msb != 15 || lsb != 0)
++			ret = phy_modify_mmd(phydev, dev, addr, GENMASK(msb, lsb),
++					     (value << lsb) & GENMASK(msb, lsb));
++		else
++			ret = phy_write_mmd(phydev, dev, addr, value);
++
+ 		if (ret)
+ 			return ret;
+ 		break;
+-- 
+2.55.0
+
