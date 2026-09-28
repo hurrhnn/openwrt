@@ -1,0 +1,54 @@
+From: hurrhnn <hurrhnn@icmp.kr>
+Date: Fri, 18 Sep 2026 22:00:00 +0900
+Subject: [PATCH] net: pcs: airoha: keep MAC-to-PHY XFI flow control off on
+ the PON PCS
+
+XFI GIB flow control is enabled towards the PHY in two places: an
+unconditional set in airoha_pcs_post_config(), and a rewrite in
+airoha_pcs_config() driven by permit_pause_to_mac (which phylink keeps
+enabled by default). phylink_major_config() invokes pcs_post_config()
+before pcs_config(), so the config-time write is the one that sticks
+and both write sites have to be changed.
+
+The MAC-to-PHY direction (XFI_TX_FC_EN) asserts backpressure towards
+the attached PHY when the fabric side is congested, e.g. by
+hardware-offloaded flows whose egress port is saturated. A
+rate-adapting copper PHY cannot relieve this backpressure when the
+copper link partner does not honour pause frames: the RTL8261N's
+USXGMII side wedges and the PHY drops and retrains the copper link,
+causing a multi-second link loss.
+
+Keep XFI_TX_FC_EN disabled for the PON PCS variant in both write sites
+so that congestion is dropped in the fabric instead of stalling the
+PHY. XFI_RX_FC_EN (the PHY pacing the MAC, required for rate
+adaptation) stays enabled.
+
+Signed-off-by: hurrhnn <hurrhnn@icmp.kr>
+---
+--- a/drivers/net/pcs/airoha/pcs-airoha-common.c
++++ b/drivers/net/pcs/airoha/pcs-airoha-common.c
+@@ -700,7 +700,10 @@
+ 	regmap_update_bits(maps->pcs_mac, AIROHA_PCS_XFI_MAC_XFI_GIB_CFG,
+ 			   AIROHA_PCS_XFI_TX_FC_EN | AIROHA_PCS_XFI_RX_FC_EN,
+ 			   permit_pause_to_mac ?
+-				AIROHA_PCS_XFI_TX_FC_EN | AIROHA_PCS_XFI_RX_FC_EN :
++				(priv->data->port_type == AIROHA_PCS_PON ?
++					AIROHA_PCS_XFI_RX_FC_EN :
++					AIROHA_PCS_XFI_TX_FC_EN |
++					AIROHA_PCS_XFI_RX_FC_EN) :
+ 				0);
+
+ 	return 0;
+@@ -960,8 +963,10 @@
+ 			   FIELD_PREP(AIROHA_PCS_XFI_IPG_NUM, 10));
+
+ 	/* Enable TX/RX flow control */
+-	regmap_set_bits(maps->pcs_mac, AIROHA_PCS_XFI_MAC_XFI_GIB_CFG,
+-			AIROHA_PCS_XFI_TX_FC_EN);
++	regmap_update_bits(maps->pcs_mac, AIROHA_PCS_XFI_MAC_XFI_GIB_CFG,
++			   AIROHA_PCS_XFI_TX_FC_EN,
++			   priv->data->port_type == AIROHA_PCS_PON ?
++				0 : AIROHA_PCS_XFI_TX_FC_EN);
+ 	regmap_set_bits(maps->pcs_mac, AIROHA_PCS_XFI_MAC_XFI_GIB_CFG,
+ 			AIROHA_PCS_XFI_RX_FC_EN);
+

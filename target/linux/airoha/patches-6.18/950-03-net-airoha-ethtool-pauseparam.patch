@@ -1,0 +1,113 @@
+From: hurrhnn <hurrhnn@icmp.kr>
+Date: Fri, 18 Sep 2026 22:10:00 +0900
+Subject: [PATCH] net: airoha: add ethtool pauseparam and per-port statistics
+
+Wire the phylink pauseparam helpers into the ethtool ops and expose the
+per-port GDM MIB counters already collected in airoha_hw_stats through
+the legacy string statistics interface, so the negotiated pause modes
+can be inspected and overridden with ethtool -a/-A and the per-port
+counters can be read with ethtool -S.
+
+Signed-off-by: hurrhnn <hurrhnn@icmp.kr>
+---
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -2804,6 +2804,86 @@
+ 	return phylink_ethtool_ksettings_set(dev->phylink, cmd);
+ }
+ 
++static void
++airoha_ethtool_get_pauseparam(struct net_device *netdev,
++			      struct ethtool_pauseparam *pause)
++{
++	struct airoha_gdm_dev *dev = netdev_priv(netdev);
++
++	phylink_ethtool_get_pauseparam(dev->phylink, pause);
++}
++
++static int
++airoha_ethtool_set_pauseparam(struct net_device *netdev,
++			      struct ethtool_pauseparam *pause)
++{
++	struct airoha_gdm_dev *dev = netdev_priv(netdev);
++
++	return phylink_ethtool_set_pauseparam(dev->phylink, pause);
++}
++
++static const char airoha_ethtool_stats_strings[][ETH_GSTRING_LEN] = {
++	"tx_ok_pkts", "tx_ok_bytes", "tx_drops", "tx_broadcast",
++	"tx_multicast", "tx_pkts_64", "tx_pkts_65_127", "tx_pkts_128_255",
++	"tx_pkts_256_511", "tx_pkts_512_1023", "tx_pkts_1024_1518",
++	"tx_pkts_1519_max", "rx_ok_pkts", "rx_ok_bytes", "rx_errors",
++	"rx_drops", "rx_crc_errors", "rx_over_errors", "rx_broadcast",
++	"rx_multicast", "rx_fragments", "rx_jabbers", "rx_pkts_64",
++	"rx_pkts_65_127", "rx_pkts_128_255", "rx_pkts_256_511",
++	"rx_pkts_512_1023", "rx_pkts_1024_1518", "rx_pkts_1519_max",
++};
++
++static void airoha_ethtool_get_strings(struct net_device *netdev, u32 sset,
++				       u8 *data)
++{
++	if (sset != ETH_SS_STATS)
++		return;
++
++	memcpy(data, airoha_ethtool_stats_strings,
++	       sizeof(airoha_ethtool_stats_strings));
++}
++
++static int airoha_ethtool_get_sset_count(struct net_device *netdev, int sset)
++{
++	if (sset != ETH_SS_STATS)
++		return -EOPNOTSUPP;
++
++	return ARRAY_SIZE(airoha_ethtool_stats_strings);
++}
++
++static void airoha_ethtool_get_stats(struct net_device *netdev,
++				     struct ethtool_stats *stats, u64 *data)
++{
++	struct airoha_gdm_dev *dev = netdev_priv(netdev);
++	unsigned int start;
++	int i, c;
++
++	airoha_update_hw_stats(dev);
++	do {
++		c = 0;
++		start = u64_stats_fetch_begin(&dev->stats.syncp);
++		data[c++] = dev->stats.tx_ok_pkts;
++		data[c++] = dev->stats.tx_ok_bytes;
++		data[c++] = dev->stats.tx_drops;
++		data[c++] = dev->stats.tx_broadcast;
++		data[c++] = dev->stats.tx_multicast;
++		for (i = 0; i < ARRAY_SIZE(dev->stats.tx_len); i++)
++			data[c++] = dev->stats.tx_len[i];
++		data[c++] = dev->stats.rx_ok_pkts;
++		data[c++] = dev->stats.rx_ok_bytes;
++		data[c++] = dev->stats.rx_errors;
++		data[c++] = dev->stats.rx_drops;
++		data[c++] = dev->stats.rx_crc_error;
++		data[c++] = dev->stats.rx_over_errors;
++		data[c++] = dev->stats.rx_broadcast;
++		data[c++] = dev->stats.rx_multicast;
++		data[c++] = dev->stats.rx_fragment;
++		data[c++] = dev->stats.rx_jabber;
++		for (i = 0; i < ARRAY_SIZE(dev->stats.rx_len); i++)
++			data[c++] = dev->stats.rx_len[i];
++	} while (u64_stats_fetch_retry(&dev->stats.syncp, start));
++}
++
+ static int airoha_qdma_set_chan_tx_sched(struct net_device *netdev,
+ 					 int channel, enum tx_sched_mode mode,
+ 					 const u16 *weights, u8 n_weights)
+@@ -3656,6 +3736,11 @@
+ 	.get_rmon_stats		= airoha_ethtool_get_rmon_stats,
+ 	.get_link_ksettings	= airoha_ethtool_get_link_ksettings,
+ 	.set_link_ksettings	= airoha_ethtool_set_link_ksettings,
++	.get_pauseparam		= airoha_ethtool_get_pauseparam,
++	.set_pauseparam		= airoha_ethtool_set_pauseparam,
++	.get_strings		= airoha_ethtool_get_strings,
++	.get_sset_count		= airoha_ethtool_get_sset_count,
++	.get_ethtool_stats	= airoha_ethtool_get_stats,
+ 	.get_link		= ethtool_op_get_link,
+ };
+ 
