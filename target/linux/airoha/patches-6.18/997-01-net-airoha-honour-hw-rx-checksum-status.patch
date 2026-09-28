@@ -1,0 +1,83 @@
+From: hurrhnn <hurrhnn@icmp.kr>
+Date: Sun, 21 Sep 2026 22:40:00 +0900
+Subject: [PATCH] net: airoha: honour the hardware RX checksum status
+
+airoha_qdma_build_rx_skb() stamps every non-LRO frame with
+CHECKSUM_UNNECESSARY without ever looking at the per-packet checksum
+status the frame engine already reports. RX MSG1 (RXD4) carries
+QDMA_ETH_RXMSG_L4_VALID_MASK, QDMA_ETH_RXMSG_IP4F_MASK and
+QDMA_ETH_RXMSG_L4F_MASK right next to the IP4/IP6 type bits the LRO path
+already trusts, but all three defines are dead code: nothing in the
+driver reads them. They have been unused since the driver was merged in
+23020f049327 ("net: airoha: Introduce ethernet support for EN7581 SoC").
+
+The Airoha frame engine keeps the MediaTek field names and order, and
+MediaTek documents them. MT7620 Programming Guide v1.3, section 2.18.7.1
+"PDMA Rx Field Descriptions", DWORD3 PKT_INFO, p.206:
+
+  Bit[4]: IPv4 packet
+  Bit[3]: IPV4 checksum error
+  Bit[1]: L4 TCP or UDP packet without fragmented flag
+  Bit[0]: L4 checksum error
+
+So L4_VALID reports only that an L4 checksum was evaluated at all - the
+frame is non-fragmented TCP or UDP - and IP4F/L4F are the failure flags.
+The correct predicate for CHECKSUM_UNNECESSARY is therefore
+L4_VALID && !(IP4F | L4F), which is what both the vendor raeth driver
+and mtk_eth_soc (rx.dma_l4_valid) use.
+
+Today the unconditional claim mostly holds by accident of a register
+written once at init: FWD_CFG's IP4_CKSUM/TCP_CKSUM/UDP_CKSUM bits make
+the GDM parser drop failing frames before they are DMAed, so a frame that
+reaches this function has generally been verified. That leaves two holes.
+Anything for which the engine evaluates no L4 checksum - IPv4/IPv6
+fragments, ICMP, SCTP, GRE/ESP - is still handed to the stack as
+verified, and for SCTP the kernel then skips CRC32c entirely. And the
+accident stops holding the moment those three bits are cleared, which is
+what an ethtool -K <dev> rx off is supposed to do and what is needed to
+inspect the frames the parser rejects: frames with a bad L4 checksum are
+then accepted without any verification.
+
+Read the status bits, and fall back to CHECKSUM_NONE unless the engine
+says it computed an L4 checksum and that checksum passed, or when RX
+checksum offload is off for the netdev. Normal TCP and UDP traffic keeps
+CHECKSUM_UNNECESSARY, so the fast path is unchanged; it costs one extra
+descriptor field read.
+
+Signed-off-by: hurrhnn <hurrhnn@icmp.kr>
+---
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -884,6 +884,7 @@
+ 	} else {
+ 		u32 desc_ctrl = le32_to_cpu(READ_ONCE(desc->ctrl));
+ 		u32 len = FIELD_GET(QDMA_DESC_LEN_MASK, desc_ctrl);
++		u32 msg1 = le32_to_cpu(READ_ONCE(desc->msg1));
+ 
+ 		skb = napi_build_skb(e->buf - AIROHA_RX_HEADROOM, q->buf_size);
+ 		if (!skb)
+@@ -891,7 +892,12 @@
+ 
+ 		skb_reserve(skb, AIROHA_RX_HEADROOM);
+ 		__skb_put(skb, len);
+-		skb->ip_summed = CHECKSUM_UNNECESSARY;
++		if ((netdev->features & NETIF_F_RXCSUM) &&
++		    (msg1 & QDMA_ETH_RXMSG_L4_VALID_MASK) &&
++		    !(msg1 & QDMA_ETH_RXMSG_CKSUM_FAIL_MASK))
++			skb->ip_summed = CHECKSUM_UNNECESSARY;
++		else
++			skb_checksum_none_assert(skb);
+ 	}
+ 
+ 	skb_mark_for_recycle(skb);
+--- a/drivers/net/ethernet/airoha/airoha_regs.h
++++ b/drivers/net/ethernet/airoha/airoha_regs.h
+@@ -910,6 +910,8 @@
+ #define QDMA_ETH_RXMSG_IP4F_MASK	BIT(28)
+ #define QDMA_ETH_RXMSG_L4_VALID_MASK	BIT(27)
+ #define QDMA_ETH_RXMSG_L4F_MASK		BIT(26)
++#define QDMA_ETH_RXMSG_CKSUM_FAIL_MASK	(QDMA_ETH_RXMSG_IP4F_MASK | \
++					 QDMA_ETH_RXMSG_L4F_MASK)
+ #define QDMA_ETH_RXMSG_SPORT_MASK	GENMASK(25, 21)
+ #define QDMA_ETH_RXMSG_CRSN_MASK	GENMASK(20, 16)
+ #define QDMA_ETH_RXMSG_PPE_ENTRY_MASK	GENMASK(15, 0)

@@ -1,0 +1,144 @@
+From: hurrhnn <hurrhnn@icmp.kr>
+Date: Sun, 21 Sep 2026 22:45:00 +0900
+Subject: [PATCH] net: airoha: make NETIF_F_RXCSUM togglable and report
+ checksum-bad frames
+
+AIROHA_HW_FEATURES advertises NETIF_F_RXCSUM in netdev->hw_features, so
+ethtool -K <dev> rx off reports success, but airoha_dev_set_features()
+only ever looks at NETIF_F_GRO_HW: the request is silently dropped and
+the GDM parser keeps verifying and discarding. Wire the feature to the
+FWD_CFG bits it actually controls. They are a property of the GDM port
+rather than of a netdev, so hardware verification is only turned off once
+no netdev on the port wants it.
+
+Those bits gate the drop, not the checksum engine, so the per-packet
+status stays available either way. MT7622 Reference Manual, GDMA FWD_CFG,
+p.1877, on the same register offset and bit positions:
+
+  22  GDM_ICS_EN  IPv4 header checksum error drop
+                  0: checksum error status reported on RX descriptor (IP4F)
+                  1: checksum error packet will be dropped
+  21  GDM_TCS_EN  TCP checksum error drop
+  20  GDM_UCS_EN  UDP checksum error drop
+
+Frames the parser rejects are otherwise unobservable: they are destroyed
+before the DMA ring and only show up as the GDM ERROR_DROP MIB counter
+(rx_errors), with no packet and no drop reason. With the offload off they
+are kept, and with the previous patch honouring the descriptor status
+they are software-verified instead of being trusted blindly.
+
+Add two module parameters to make them visible. rx_csum_err_count counts
+frames whose descriptor reports a checksum failure; it is a plain counter
+bumped from NAPI, so concurrent RX queues may lose an increment.
+rx_csum_err_dump is the number of bytes to hexdump per such frame
+(0 disables), rate-limited, starting at the MAC header; the log line
+reports the full frame length so a truncated dump is visible. With the
+offload off the ERROR_DROP MIB stops advancing, so these replace
+rx_errors as the signal.
+
+Signed-off-by: hurrhnn <hurrhnn@icmp.kr>
+---
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -908,6 +908,41 @@
+ 	return skb;
+ }
+ 
++static unsigned int rx_csum_err_dump;
++module_param(rx_csum_err_dump, uint, 0644);
++MODULE_PARM_DESC(rx_csum_err_dump,
++		 "hexdump up to N bytes of each RX frame the FE flags checksum-bad (0: off)");
++
++static unsigned int rx_csum_err_count;
++module_param(rx_csum_err_count, uint, 0644);
++MODULE_PARM_DESC(rx_csum_err_count,
++		 "RX frames delivered to the CPU with a FE checksum failure flag");
++
++static void airoha_qdma_rx_dump_csum_err(struct net_device *netdev,
++					 struct sk_buff *skb, u32 msg1)
++{
++	unsigned int lim = READ_ONCE(rx_csum_err_dump);
++	unsigned int l2_len, linear;
++
++	if (!lim || !net_ratelimit())
++		return;
++
++	l2_len = skb->data - skb_mac_header(skb);
++	linear = skb_headlen(skb) + l2_len;
++
++	netdev_warn(netdev,
++		    "rx checksum error: frame=%u linear=%u msg1=%08x [%s%s%s%s] sport=%u crsn=%u\n",
++		    skb->len + l2_len, linear, msg1,
++		    msg1 & QDMA_ETH_RXMSG_IP4_MASK ? "ip4 " : "",
++		    msg1 & QDMA_ETH_RXMSG_IP6_MASK ? "ip6 " : "",
++		    msg1 & QDMA_ETH_RXMSG_IP4F_MASK ? "ip4-fail " : "",
++		    msg1 & QDMA_ETH_RXMSG_L4F_MASK ? "l4-fail" : "",
++		    (u32)FIELD_GET(QDMA_ETH_RXMSG_SPORT_MASK, msg1),
++		    (u32)FIELD_GET(QDMA_ETH_RXMSG_CRSN_MASK, msg1));
++	print_hex_dump(KERN_WARNING, "airoha-rx: ", DUMP_PREFIX_OFFSET, 16, 1,
++		       skb_mac_header(skb), min(linear, lim), true);
++}
++
+ static int airoha_qdma_rx_process(struct airoha_queue *q, int budget)
+ {
+ 	enum dma_data_direction dir = page_pool_get_dma_dir(q->page_pool);
+@@ -993,6 +1028,11 @@
+ 			airoha_ppe_check_skb(&eth->ppe->dev, q->skb, hash,
+ 					     false);
+ 
++		if (unlikely(msg1 & QDMA_ETH_RXMSG_CKSUM_FAIL_MASK)) {
++			rx_csum_err_count++;
++			airoha_qdma_rx_dump_csum_err(netdev, q->skb, msg1);
++		}
++
+ 		done++;
+ 		napi_gro_receive(&q->napi, q->skb);
+ 		q->skb = NULL;
+@@ -2779,6 +2819,37 @@
+ 	return features;
+ }
+ 
++static void airoha_dev_sync_rxcsum(struct airoha_gdm_dev *dev,
++				   netdev_features_t features)
++{
++	u32 mask = GDM_IP4_CKSUM_MASK | GDM_TCP_CKSUM_MASK | GDM_UDP_CKSUM_MASK;
++	struct airoha_gdm_port *port = dev->port;
++	struct airoha_eth *eth = dev->eth;
++	bool enable = false;
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(port->devs); i++) {
++		struct airoha_gdm_dev *iter_dev = port->devs[i];
++		netdev_features_t iter_features;
++
++		if (!iter_dev)
++			continue;
++
++		iter_features = iter_dev == dev
++				? features
++				: netdev_from_priv(iter_dev)->features;
++		if (iter_features & NETIF_F_RXCSUM) {
++			enable = true;
++			break;
++		}
++	}
++
++	if (enable)
++		airoha_fe_set(eth, REG_GDM_FWD_CFG(port->id), mask);
++	else
++		airoha_fe_clear(eth, REG_GDM_FWD_CFG(port->id), mask);
++}
++
+ static int airoha_dev_set_features(struct net_device *netdev,
+ 				   netdev_features_t features)
+ {
+@@ -2787,6 +2858,9 @@
+ 	struct airoha_qdma *qdma = airoha_qdma_deref(dev);
+ 	int qdma_id = qdma - &dev->eth->qdma[0];
+ 
++	if (diff & NETIF_F_RXCSUM)
++		airoha_dev_sync_rxcsum(dev, features);
++
+ 	if (!(diff & NETIF_F_GRO_HW))
+ 		return 0;
+ 
