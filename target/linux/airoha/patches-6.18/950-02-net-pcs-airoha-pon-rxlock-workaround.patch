@@ -1,0 +1,25 @@
+From: hurrhnn <hurrhnn@icmp.kr>
+Date: Fri, 18 Sep 2026 21:30:00 +0900
+Subject: [PATCH] net: pcs: airoha: enable rxlock workaround for the PON PCS
+
+The ETH PCS variant recovers a stuck USXGMII RX (PCS reporting link
+down while the RX SigDet module still detects a signal) by triggering a
+CDR reset from pcs_get_state(). The PON PCS variant does not use the
+workaround, so a stuck RX on a PON PCS port persists until the attached
+PHY gives up and retrains the copper link.
+
+The workaround only operates on per-port regmaps and is not specific to
+the ETH variant. Enable it for the PON PCS as well.
+
+Signed-off-by: hurrhnn <hurrhnn@icmp.kr>
+---
+--- a/drivers/net/pcs/airoha/pcs-airoha-common.c
++++ b/drivers/net/pcs/airoha/pcs-airoha-common.c
+@@ -1391,6 +1391,7 @@
+ 	.alloc_regmap_fields = an7581_pcs_alloc_regmap_fields,
+ 	.bringup = an7581_pcs_bringup,
+ 	.link_up = an7581_pcs_phya_link_up,
++	.rxlock_workaround = an7581_pcs_rxlock_workaround,
+ };
+ 
+ static const struct airoha_pcs_match_data an7581_pcs_pcie = {

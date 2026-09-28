@@ -1,0 +1,49 @@
+From: hurrhnn <hurrhnn@icmp.kr>
+Date: Wed, 30 Sep 2026 02:30:00 +0900
+Subject: [PATCH] net: pcs: airoha: keep the Ethernet XSI MAC out of reset on reopen
+
+Every ndo_open runs phylink_start(), whose major configuration calls
+pcs_pre_config(). On the Ethernet PCS this pulses the SCU XSI MAC/PHY
+resets and the XFI MAC logic reset each time the port is brought up,
+even when the interface mode does not change. When offloaded traffic
+keeps arriving while the port is down, the GDM feeding the MAC holds a
+frame from its output queue across these resets, and once the link is
+back its TX channel locks up for good: MBI_TX_BUSY stays set, the MAC
+transmits nothing and only a reboot recovers the port.
+
+The resets are only needed to select the XSI mode, so skip them and the
+counter clear when the Ethernet PCS is reconfigured for the interface
+it already runs. The first configuration and any interface change still
+reset the XSI MAC and PHY as before, and the PON PCS is left unchanged.
+
+Signed-off-by: hurrhnn <hurrhnn@icmp.kr>
+---
+--- a/drivers/net/pcs/airoha/pcs-airoha-common.c
++++ b/drivers/net/pcs/airoha/pcs-airoha-common.c
+@@ -914,11 +914,15 @@ static void airoha_pcs_pre_config(struct
+ 	struct airoha_pcs_port *port = to_airoha_pcs_port(pcs);
+ 	struct airoha_pcs_priv *priv = port->priv;
+ 	struct airoha_pcs_maps *maps;
++	bool full_reset;
+ 
+ 	maps = &priv->maps[port->index];
++	full_reset = priv->data->port_type != AIROHA_PCS_ETH ||
++		     priv->interface != interface;
+ 
+ 	/* Select HSGMII or USXGMII in SCU regs */
+-	airoha_pcs_setup_scu(priv, port->index, interface);
++	if (full_reset)
++		airoha_pcs_setup_scu(priv, port->index, interface);
+ 
+ 	/* MPI MBI disable */
+ 	regmap_set_bits(maps->pcs_mac, AIROHA_PCS_XFI_MAC_XFI_GIB_CFG,
+@@ -927,6 +931,9 @@ static void airoha_pcs_pre_config(struct
+ 			AIROHA_PCS_XFI_TXMPI_STOP |
+ 			AIROHA_PCS_XFI_TXMBI_STOP);
+ 
++	if (!full_reset)
++		return;
++
+ 	/* Write 1 to trigger reset and clear */
+ 	regmap_clear_bits(maps->pcs_mac, AIROHA_PCS_XFI_MAC_XFI_LOGIC_RST,
+ 			  AIROHA_PCS_XFI_MAC_LOGIC_RST);

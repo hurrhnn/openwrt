@@ -1,0 +1,238 @@
+From: hurrhnn <hurrhnn@icmp.kr>
+Date: Tue, 29 Sep 2026 08:30:00 +0900
+Subject: [PATCH] net: airoha: gate GDM3/GDM4 TX across MAC reset
+
+Every ndo_open runs phylink_start(), and its major configuration calls
+the PCS pre_config hook, which on GDM3/GDM4 pulses the XSI MAC/PHY
+resets and the XFI MAC logic reset with the MPI/MBI stop bits set. The
+link-down path sets the same stop bits. Nothing keeps the GDM from
+fetching frames out of its PSE output queue meanwhile, so when the port
+is cycled while frames for it are still queued, the GDM can be caught
+in the middle of an MBI transfer. MBI_TX_BUSY in REG_GDM_CHN_RLS then
+stays set, the GDM TX channel keeps its frame, the MAC transmits nothing
+more and the output queue only grows while RX keeps working. Nothing
+short of a reboot brings the port back.
+
+Clearing REG_GDM_TXCHN_EN holds the frames in the output queue without
+dropping them and lets the GDM finish the transfer in progress. Use it
+to keep the GDM out of MBI transfers whenever the MAC is not running:
+- close it before phylink_start() in ndo_open, so the PCS resets never
+  run while the GDM is transferring;
+- close it in mac_link_down(), which runs before pcs_link_down() sets
+  the stop bits, and wait for MBI_TX_BUSY to clear;
+- in ndo_stop, once the TX queues are disabled and while the link is
+  still up, give the frames the device still has in flight, its output
+  queue, the GDM2 loopback queue in WAN mode and the GDM TX channel a
+  bounded time to drain before closing it, so as little as possible is
+  held for the next link up;
+- reopen it as the last step of mac_link_up(), after pcs_link_up() has
+  cleared the stop bits.
+
+Frames that still reach the output queue after the gate is closed, from
+offloaded flows or from the QDMA forwarding queues, are held until the
+next link up, so the drain cannot always leave the port idle. Report the
+queued pages and the TX channel state whenever the gate is closed with
+frames pending, and warn if MBI_TX_BUSY does not clear.
+
+The enable register is per GDM, so the gate is only used on GDM3/GDM4
+ports driven by a single device. GDM1 and GDM2 are left untouched.
+
+Signed-off-by: hurrhnn <hurrhnn@icmp.kr>
+---
+ drivers/net/ethernet/airoha/airoha_eth.c  |  126 +++++++++++++++++++++++++++++-
+ drivers/net/ethernet/airoha/airoha_regs.h |    5 +
+ 2 files changed, 129 insertions(+), 2 deletions(-)
+
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -2209,6 +2209,120 @@ static void airoha_dev_set_mtu(struct ne
+ 			      FIELD_PREP(WAN_MTU0_MASK, netdev->mtu + VLAN_ETH_HLEN));
+ }
+ 
++static bool airoha_dev_has_tx_gate(struct airoha_gdm_dev *dev)
++{
++	struct airoha_gdm_port *port = dev->port;
++	int i;
++
++	if (port->id != AIROHA_GDM3_IDX && port->id != AIROHA_GDM4_IDX)
++		return false;
++
++	for (i = 0; i < ARRAY_SIZE(port->devs); i++) {
++		if (port->devs[i] && port->devs[i] != dev)
++			return false;
++	}
++
++	return true;
++}
++
++static bool airoha_dev_tx_inflight(struct net_device *netdev)
++{
++#ifdef CONFIG_BQL
++	int i;
++
++	for (i = 0; i < netdev->num_tx_queues; i++) {
++		struct netdev_queue *txq = netdev_get_tx_queue(netdev, i);
++
++		if (READ_ONCE(txq->dql.num_queued) !=
++		    READ_ONCE(txq->dql.num_completed))
++			return true;
++	}
++#endif
++	return false;
++}
++
++static u32 airoha_fe_pse_oq_pages(struct airoha_eth *eth, int pse_port)
++{
++	return airoha_fe_get(eth, REG_FE_PSE_PORT_STA(pse_port),
++			     PSE_PORT_OQ_CNT_MASK);
++}
++
++static bool airoha_dev_tx_idle(struct airoha_gdm_dev *dev)
++{
++	struct airoha_gdm_port *port = dev->port;
++	struct airoha_eth *eth = dev->eth;
++
++	if (airoha_dev_tx_inflight(netdev_from_priv(dev)))
++		return false;
++
++	if (airoha_fe_pse_oq_pages(eth, airoha_get_fe_port(dev)))
++		return false;
++
++	if (!airoha_is_lan_gdm_dev(dev) &&
++	    airoha_fe_pse_oq_pages(eth, FE_PSE_PORT_GDM2))
++		return false;
++
++	if (airoha_fe_rr(eth, REG_GDM_CHN_RLS(port->id)) & MBI_TX_BUSY_MASK)
++		return false;
++
++	return !airoha_fe_rr(eth, REG_GDM_TXCHN_VLD(port->id));
++}
++
++static void airoha_dev_tx_gate_close(struct airoha_gdm_dev *dev)
++{
++	struct net_device *netdev = netdev_from_priv(dev);
++	struct airoha_gdm_port *port = dev->port;
++	struct airoha_eth *eth = dev->eth;
++	u32 val, pages, vld;
++	int err;
++
++	if (!airoha_dev_has_tx_gate(dev))
++		return;
++
++	if (!airoha_fe_rr(eth, REG_GDM_TXCHN_EN(port->id)))
++		return;
++
++	airoha_fe_wr(eth, REG_GDM_TXCHN_EN(port->id), 0);
++	err = read_poll_timeout(airoha_fe_rr, val, !(val & MBI_TX_BUSY_MASK),
++				20, 10 * USEC_PER_MSEC, false,
++				eth, REG_GDM_CHN_RLS(port->id));
++
++	pages = airoha_fe_pse_oq_pages(eth, airoha_get_fe_port(dev));
++	vld = airoha_fe_rr(eth, REG_GDM_TXCHN_VLD(port->id));
++	if (err) {
++		if (net_ratelimit())
++			netdev_warn(netdev,
++				    "GDM%d TX busy after gating, %u pages queued, vld %#x\n",
++				    port->id, pages, vld);
++	} else if ((pages || vld) && net_ratelimit()) {
++		netdev_info(netdev,
++			    "GDM%d TX gated with %u pages queued, vld %#x\n",
++			    port->id, pages, vld);
++	}
++}
++
++static void airoha_dev_tx_gate_open(struct airoha_gdm_dev *dev)
++{
++	if (!airoha_dev_has_tx_gate(dev))
++		return;
++
++	airoha_fe_wr(dev->eth, REG_GDM_TXCHN_EN(dev->port->id), 0xffffffff);
++}
++
++static void airoha_dev_tx_gate_drain(struct airoha_gdm_dev *dev)
++{
++	bool idle;
++
++	if (!airoha_dev_has_tx_gate(dev))
++		return;
++
++	if (netif_carrier_ok(netdev_from_priv(dev)))
++		read_poll_timeout(airoha_dev_tx_idle, idle, idle, 100,
++				  20 * USEC_PER_MSEC, false, dev);
++
++	airoha_dev_tx_gate_close(dev);
++}
++
+ static int airoha_dev_open(struct net_device *netdev)
+ {
+ 	struct airoha_gdm_dev *dev = netdev_priv(netdev);
+@@ -2237,6 +2351,7 @@ static int airoha_dev_open(struct net_de
+ 		return err;
+ 	}
+ 
++	airoha_dev_tx_gate_close(dev);
+ 	phylink_start(dev->phylink);
+ 
+ 	netif_tx_start_all_queues(netdev);
+@@ -2278,6 +2393,7 @@ static int airoha_dev_stop(struct net_de
+ 	struct airoha_qdma *qdma;
+ 
+ 	netif_tx_disable(netdev);
++	airoha_dev_tx_gate_drain(dev);
+ 	airoha_set_vip_for_gdm_port(dev, false);
+ 
+ 	qdma = airoha_qdma_deref(dev);
+@@ -3918,7 +4034,7 @@ static void airoha_mac_link_up(struct ph
+ 
+ 	/* TX/RX frag is configured only for GDM4 */
+ 	if (port->id != AIROHA_GDM4_IDX)
+-		return;
++		goto open_tx_gate;
+ 
+ 	switch (speed) {
+ 	case SPEED_10000:
+@@ -3961,12 +4077,18 @@ static void airoha_mac_link_up(struct ph
+ 	airoha_fe_rmw(eth, REG_FE_GDM4_RMBI_FRAG, mask, val);
+ 
+ 	spin_unlock(&port->lock);
++
++open_tx_gate:
++	airoha_dev_tx_gate_open(dev);
+ }
+ 
+-/* Nothing to do in MAC, everything is handled in PCS */
+ static void airoha_mac_link_down(struct phylink_config *config, unsigned int mode,
+ 				 phy_interface_t interface)
+ {
++	struct airoha_gdm_dev *dev = container_of(config, struct airoha_gdm_dev,
++						  phylink_config);
++
++	airoha_dev_tx_gate_close(dev);
+ }
+ 
+ static const struct phylink_mac_ops airoha_phylink_ops = {
+--- a/drivers/net/ethernet/airoha/airoha_regs.h
++++ b/drivers/net/ethernet/airoha/airoha_regs.h
+@@ -106,6 +106,9 @@
+ #define PSE_IQ_RES2_P5_MASK		GENMASK(15, 8)
+ #define PSE_IQ_RES2_P4_MASK		GENMASK(7, 0)
+ 
++#define REG_FE_PSE_PORT_STA(_n)		(PSE_BASE + 0x50 + ((_n) << 2))
++#define PSE_PORT_OQ_CNT_MASK		GENMASK(14, 0)
++
+ #define REG_FE_VIP_EN(_n)		(0x0300 + ((_n) << 3))
+ #define PATN_FCPU_EN_MASK		BIT(7)
+ #define PATN_SWP_EN_MASK		BIT(6)
+@@ -175,10 +178,12 @@
+ 
+ #define REG_GDM_CHN_RLS(_n)		(GDM_BASE(_n) + 0x20)
+ #define MBI_RX_AGE_SEL_MASK		GENMASK(26, 25)
++#define MBI_TX_BUSY_MASK		BIT(19)
+ #define MBI_TX_AGE_SEL_MASK		GENMASK(18, 17)
+ 
+ #define REG_GDM_TXCHN_EN(_n)		(GDM_BASE(_n) + 0x24)
+ #define REG_GDM_RXCHN_EN(_n)		(GDM_BASE(_n) + 0x28)
++#define REG_GDM_TXCHN_VLD(_n)		(GDM_BASE(_n) + 0x70)
+ 
+ #define REG_FE_CPORT_CFG		(GDM1_BASE + 0x40)
+ #define FE_CPORT_PAD			BIT(26)

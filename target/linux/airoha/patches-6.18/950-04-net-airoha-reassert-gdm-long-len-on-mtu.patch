@@ -1,0 +1,63 @@
+From: hurrhnn <hurrhnn@icmp.kr>
+Date: Fri, 18 Sep 2026 23:50:00 +0900
+Subject: [PATCH] net: airoha: re-assert GDM long frame limit when the MTU is
+ applied
+
+airoha_fe_maccr_init() programs a 16128 byte long frame limit into
+every GDM at probe time, but the NPU firmware rewrites GDM1's
+REG_GDM_LEN_CFG while handling PPE_FUNC_SET_WAIT_HWNAT_INIT: it keeps
+the short length and forces the long length to 1700 bytes, or 4004 when
+init_info.max_packet is nonzero. airoha_npu_ppe_init() leaves
+max_packet at 0, so every PPE/offload init caps GDM1 at 1700. Only GDM1
+is touched.
+
+Frames above the limit are silently discarded at GDM ingress before
+they reach the QDMA, so CPU-bound jumbo traffic entering through the
+DSA conduit (GDM1) is dropped even though the conduit MTU, the switch
+max frame length and the QDMA scatter RX path all handle it. Setting
+max_packet only raises the cap to 4004, so the kernel's limit has to be
+re-asserted after the firmware has run.
+
+Re-assert the probe-time limit from airoha_dev_set_mtu(), which runs on
+ndo_open and on every MTU change for all GDM net_devices (including the
+DSA conduit, whose MTU the DSA core raises whenever a user port MTU is
+raised).
+
+On boot the offload setup (and with it the firmware's HWNAT init) runs
+after the net_devices are already up, so the MTU-time re-assert alone
+loses the race. Also re-assert the limit right after
+airoha_ppe_wait_for_npu_init() succeeds in airoha_ppe_offload_setup(),
+which runs strictly after the firmware's rewrite and again on every
+later offload re-init.
+
+Signed-off-by: hurrhnn <hurrhnn@icmp.kr>
+---
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -2136,7 +2136,12 @@
+ static void airoha_dev_set_mtu(struct net_device *netdev)
+ {
+ 	struct airoha_gdm_dev *dev = netdev_priv(netdev);
++	struct airoha_gdm_port *port = dev->port;
+
++	airoha_fe_rmw(dev->eth, REG_GDM_LEN_CFG(port->id),
++		      GDM_LONG_LEN_MASK,
++		      FIELD_PREP(GDM_LONG_LEN_MASK, AIROHA_MAX_RX_SIZE));
++
+ 	airoha_ppe_set_mtu(dev);
+ 	if (!airoha_is_lan_gdm_dev(dev))
+ 		airoha_fe_rmw(dev->eth, REG_WAN_MTU0,
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -1466,6 +1466,11 @@
+ 	if (err)
+ 		goto error_npu_put;
+ 
++	airoha_fe_rmw(eth, REG_GDM_LEN_CFG(1),
++		      GDM_SHORT_LEN_MASK | GDM_LONG_LEN_MASK,
++		      FIELD_PREP(GDM_SHORT_LEN_MASK, 60) |
++		      FIELD_PREP(GDM_LONG_LEN_MASK, AIROHA_MAX_RX_SIZE));
++
+ 	ppe_num_stats_entries = airoha_ppe_get_total_num_stats_entries(ppe);
+ 	if (ppe_num_stats_entries > 0) {
+ 		err = npu->ops.ppe_init_stats(npu, ppe->foe_stats_dma,
