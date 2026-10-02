@@ -1,0 +1,31 @@
+From: hurrhnn <hurrhnn@icmp.kr>
+Date: Sun, 4 Oct 2026 04:10:00 +0900
+Subject: [PATCH] net: airoha: give the CPU reason RX ring 1024 descriptors
+
+QDMA RX ring 1 receives the frames that CDM1 queue 1 collects: the
+CPU reasons that airoha_fe_crsn_qsel_init() maps there, among them hit
+bind force to CPU (CRSN 0x16), and the results of the SOE. It has 32
+descriptors.
+
+When a bound FOE entry forwards a flow to the CPU, the frames of a TCP
+burst arrive at line rate. An ESP tunnel whose inbound SA was bound in
+the PPE with the SOE decrypt hop and the CPU as its destination lost
+about 1 % of the inbound TCP segments, one or two at a time, about ten
+times per second at 26 Mbit/s, while the PSE counted no drop.
+
+Give ring 1 the 1024 descriptors of ring 0.
+
+Signed-off-by: hurrhnn <hurrhnn@icmp.kr>
+---
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -48,7 +48,8 @@ struct airoha_soe;
+ 	 (_n) ==  4 ? 128 :		\
+ 	 (_n) == 11 ? 128 :		\
+ 	 (_n) == 15 ? 128 :		\
+-	 (_n) ==  0 ? 1024 : 32)
++	 (_n) ==  0 ? 1024 :		\
++	 (_n) ==  1 ? 1024 : 32)
+ 
+ #define AIROHA_LRO_PAGE_ORDER		order_base_2(SZ_16K / PAGE_SIZE)
+ #define AIROHA_MAX_NUM_LRO_QUEUES	8

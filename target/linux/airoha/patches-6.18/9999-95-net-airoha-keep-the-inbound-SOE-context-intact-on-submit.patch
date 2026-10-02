@@ -1,0 +1,40 @@
+From: hurrhnn <hurrhnn@icmp.kr>
+Date: Sat, 3 Oct 2026 05:47:00 +0900
+Subject: [PATCH] net: airoha: keep the inbound SOE context intact on submit
+
+airoha_soe_submit_prepared_skb() clears ctx->tx.deferred_skb,
+deferred_sa and deferred_dev for every context it submits. The tx and
+rx members of struct airoha_soe_ctx share a union, and for an inbound
+context these stores land on rx.saddr, rx.sport, rx.seq, rx.foe_hash and
+rx.foe_valid. airoha_soe_complete_in() then hands a zero ESP sequence
+number to xfrm_dev_packet_input_state_check(), whose replay check
+rejects it, so with a replay window every inbound packet that completes
+through the SOE CPU path is dropped. Without a replay window the NAT-T
+check compares a zero source address and port with the SA, so every
+ESP-in-UDP packet looks like a peer mapping change, calls
+km_new_mapping() and disables the PPE path of the SA.
+
+Only outbound contexts are ever deferred, so clear the deferral fields
+for them alone. Inbound contexts keep the outer source address and
+port, the ESP sequence number and the FOE metadata recorded by
+airoha_soe_rx_plain_skb() until their completion.
+
+Signed-off-by: hurrhnn <hurrhnn@icmp.kr>
+---
+--- a/drivers/net/ethernet/airoha/airoha_soe.c
++++ b/drivers/net/ethernet/airoha/airoha_soe.c
+@@ -2391,9 +2391,11 @@ airoha_soe_submit_prepared_skb(struct ai
+ 		spin_unlock_bh(&sa->lock);
+ 		return err;
+ 	}
+-	ctx->tx.deferred_skb = NULL;
+-	ctx->tx.deferred_sa = NULL;
+-	ctx->tx.deferred_dev = NULL;
++	if (ctx->dir == AIROHA_SOE_CTX_OUT) {
++		ctx->tx.deferred_skb = NULL;
++		ctx->tx.deferred_sa = NULL;
++		ctx->tx.deferred_dev = NULL;
++	}
+ 	if (untracked) {
+ 		/* A bound PPE entry consumes the SOE result instead of returning
+ 		 * it as a CPU completion. The bind barrier has already drained

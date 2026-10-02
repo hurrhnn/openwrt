@@ -1,0 +1,190 @@
+From: hurrhnn <hurrhnn@icmp.kr>
+Date: Sat, 3 Oct 2026 05:18:53 +0900
+Subject: [PATCH] net: airoha: reset the SOE block before first access
+
+The SOE node describes no reset, so airoha_soe_init() starts from
+whatever state the bootloader or a previous kernel left in the engine:
+SA entries, sequence state, latched error status and the GLB_CFG
+enables are inherited, and the SA table wipe relies on a block that
+still completes its SA commit handshake. EN7581_SOE_RST is already part
+of the EN7581 reset bindings and maps to SCU RST_CTRL2 bit 26 in
+clk-en7523, so a defined starting point is available but unused.
+
+Describe the line as an optional single resets entry of the SOE node
+and take it as an optional exclusive reset of that node, not of the
+Ethernet device, since SOE is a sibling node. When the node is
+available, pulse the reset (assert, 1-2 ms, deassert, 1-2 ms) right
+before the first SOE register access in airoha_soe_init(); a get,
+assert or deassert failure makes airoha_soe_init() fail before any SOE
+MMIO. The handle is held for the lifetime of the SOE instance and
+released on every later init failure and in airoha_soe_deinit()
+without asserting the line again, so a failed init or a remove leaves
+the block disabled through GLB_CFG and INT_EN but out of reset, the
+state the rest of the frame engine already runs with. Without a resets
+property the behaviour is unchanged, and a disabled or missing SOE node
+never touches the reset.
+
+Signed-off-by: hurrhnn <hurrhnn@icmp.kr>
+---
+--- a/Documentation/devicetree/bindings/net/airoha,en7581-soe.yaml
++++ b/Documentation/devicetree/bindings/net/airoha,en7581-soe.yaml
+@@ -23,6 +23,9 @@ properties:
+   interrupts:
+     maxItems: 1
+ 
++  resets:
++    maxItems: 1
++
+ required:
+   - compatible
+   - reg
+@@ -34,6 +37,7 @@ examples:
+   - |
+     #include <dt-bindings/interrupt-controller/arm-gic.h>
+     #include <dt-bindings/interrupt-controller/irq.h>
++    #include <dt-bindings/reset/airoha,en7581-reset.h>
+ 
+     soc {
+       #address-cells = <2>;
+@@ -43,6 +47,7 @@ examples:
+         compatible = "airoha,en7581-soe";
+         reg = <0 0x1fbfa000 0 0x268>;
+         interrupts = <GIC_SPI 79 IRQ_TYPE_LEVEL_HIGH>;
++        resets = <&scuclk EN7581_SOE_RST>;
+       };
+     };
+ ...
+--- a/arch/arm64/boot/dts/airoha/en7581.dtsi
++++ b/arch/arm64/boot/dts/airoha/en7581.dtsi
+@@ -351,6 +351,7 @@
+ 			compatible = "airoha,en7581-soe";
+ 			reg = <0x0 0x1fbfa000 0x0 0x268>;
+ 			interrupts = <GIC_SPI 79 IRQ_TYPE_LEVEL_HIGH>;
++			resets = <&scuclk EN7581_SOE_RST>;
+ 		};
+ 
+ 		eth: ethernet@1fb50000 {
+--- a/drivers/net/ethernet/airoha/airoha_soe.c
++++ b/drivers/net/ethernet/airoha/airoha_soe.c
+@@ -16,6 +16,7 @@
+ #include <linux/bitfield.h>
+ #include <linux/bitmap.h>
+ #include <linux/completion.h>
++#include <linux/delay.h>
+ #include <linux/device.h>
+ #include <linux/err.h>
+ #include <linux/if_ether.h>
+@@ -32,6 +33,7 @@
+ #include <linux/of_irq.h>
+ #include <linux/rcupdate.h>
+ #include <linux/refcount.h>
++#include <linux/reset.h>
+ #include <linux/skbuff.h>
+ #include <linux/slab.h>
+ #include <linux/spinlock.h>
+@@ -290,6 +292,7 @@ struct airoha_soe {
+ 	struct airoha_eth *eth;
+ 	struct device *dev;
+ 	void __iomem *base;
++	struct reset_control *rst;
+ 	int irq;
+ 	struct list_head list;
+ 	struct notifier_block netdev_nb;
+@@ -3805,6 +3808,44 @@ static int airoha_soe_wipe_hw(struct air
+ 	return 0;
+ }
+ 
++static int airoha_soe_hw_reset(struct airoha_soe *soe, struct device_node *np)
++{
++	struct reset_control *rst;
++	int err;
++
++	rst = of_reset_control_get_optional_exclusive(np, NULL);
++	if (IS_ERR(rst))
++		return dev_err_probe(soe->dev, PTR_ERR(rst),
++				     "failed to get SOE reset\n");
++	if (!rst)
++		return 0;
++
++	err = reset_control_assert(rst);
++	if (err)
++		goto put_rst;
++
++	usleep_range(1000, 2000);
++	err = reset_control_deassert(rst);
++	if (err)
++		goto put_rst;
++
++	usleep_range(1000, 2000);
++	soe->rst = rst;
++
++	return 0;
++
++put_rst:
++	reset_control_put(rst);
++
++	return dev_err_probe(soe->dev, err, "failed to reset SOE\n");
++}
++
++static void airoha_soe_hw_reset_put(struct airoha_soe *soe)
++{
++	reset_control_put(soe->rst);
++	soe->rst = NULL;
++}
++
+ static struct device_node *airoha_soe_find_node(struct airoha_eth *eth)
+ {
+ 	struct device_node *parent, *np;
+@@ -3891,29 +3932,33 @@ int airoha_soe_init(struct airoha_eth *e
+ 	INIT_WORK(&soe->bind_tx_work, airoha_soe_bind_tx_work);
+ 	soe->netdev_nb.notifier_call = airoha_soe_netdev_event;
+ 
++	err = airoha_soe_hw_reset(soe, np);
++	if (err)
++		goto release_group;
++
+ 	err = airoha_soe_wipe_hw(soe);
+ 	if (err) {
+ 		err = dev_err_probe(dev, err, "failed to wipe SOE SA table\n");
+-		goto release_group;
++		goto put_reset;
+ 	}
+ 
+ 	irq = of_irq_get(np, 0);
+ 	if (irq < 0) {
+ 		err = dev_err_probe(dev, irq, "failed to get SOE IRQ\n");
+-		goto release_group;
++		goto put_reset;
+ 	}
+ 
+ 	err = devm_request_irq(dev, irq, airoha_soe_irq_handler, 0,
+ 			       "airoha-soe", soe);
+ 	if (err) {
+ 		err = dev_err_probe(dev, err, "failed to request SOE IRQ\n");
+-		goto release_group;
++		goto put_reset;
+ 	}
+ 	soe->irq = irq;
+ 
+ 	err = register_netdevice_notifier(&soe->netdev_nb);
+ 	if (err)
+-		goto release_group;
++		goto put_reset;
+ 
+ 	devres_remove_group(dev, group);
+ 	eth->soe = soe;
+@@ -3921,6 +3966,8 @@ int airoha_soe_init(struct airoha_eth *e
+ 
+ 	return 0;
+ 
++put_reset:
++	airoha_soe_hw_reset_put(soe);
+ release_group:
+ 	devres_release_group(dev, group);
+ put_node:
+@@ -3992,4 +4039,5 @@ void airoha_soe_deinit(struct airoha_eth
+ 
+ 	airoha_soe_disable_hw(soe);
+ 	writel(AIROHA_SOE_INT_ALL, soe->base + AIROHA_SOE_INT_STS);
++	airoha_soe_hw_reset_put(soe);
+ }

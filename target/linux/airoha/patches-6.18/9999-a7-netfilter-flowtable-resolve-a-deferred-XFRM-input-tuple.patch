@@ -1,0 +1,327 @@
+From: hurrhnn <hurrhnn@icmp.kr>
+Date: Fri, 9 Oct 2026 20:30:00 +0900
+Subject: [PATCH] netfilter: flowtable: resolve a deferred XFRM input tuple
+
+nft_flow_route() defers the input state of the reply tuple when a flow
+that a local host opened through a packet offload tunnel is created
+from a packet of that host: the original direction is plaintext from
+the LAN, and the packet does not carry the state that will authenticate
+the reply. nft_flow_offload_eval() then leaves NF_FLOW_HW_BIDIRECTIONAL
+clear, and only the original direction is offloaded. From then on
+IPS_OFFLOAD_BIT keeps every packet of the connection away from
+nft_flow_route(), so nothing gives the reply tuple its state, and the
+reply direction stays on the CPU until the flow ends. This happens to
+every TCP connection that a local host opens, as conntrack has it
+established and assured only at the ACK with which that host completes
+the handshake, and to a UDP flow whose LAN side sends twice before the
+first reply.
+
+When a packet of the reply direction that nft_flow_offload_skip()
+admitted with a secpath, that is one verified and policy checked
+inbound packet offload state with the current policy generation and a
+hardware flow id, finds IPS_OFFLOAD_BIT set, look its flow up. If the
+reply tuple is still deferred, give it the state and the flow id of the
+packet, set NF_FLOW_HW_BIDIRECTIONAL and queue a FLOW_CLS_REPLACE. The
+flow then looks like one that an authenticated reply created.
+
+The key is built from the conntrack tuple, as flow_offload_fill_dir()
+builds it, and the input device of the packet. The packet cannot serve
+as the key in the forward chain, as it does in the ingress hook, because
+NAT has rewritten it by then. A deferred tuple has no encapsulation,
+and its input device is the device of the XFRM route, which the packet
+came in on. A packet that came in elsewhere finds no flow and changes
+nothing. A state that is no longer valid is not attached. A flow whose
+policy generation is no longer the current one is torn down, as the
+software path does; a packet that was checked against an older
+generation than the flow is ignored.
+
+The tuple is changed with NF_FLOW_HW_PENDING owned by the work item of
+the FLOW_CLS_REPLACE, which is allocated first and clears the bit once
+it has run. Until then no other offload work of the flow reads the
+tuple, a concurrent resolver finds the bit taken, and the GC cannot
+queue the FLOW_CLS_DESTROY that has to complete before it frees the
+flow. A resolver that finds the bit taken changes nothing, and the next
+packet tries again. flow_offload_refresh() cannot be used: its
+FLOW_CLS_REPLACE is dropped when the bit is taken, by the stats work of
+the GC for example, and nothing would offer the reply direction again.
+Once it owns the bit, the resolver checks that the flow is not torn
+down, closing or dying and that the tuple is still deferred without a
+state. These flags share the word of the bit, so a teardown that came
+first is seen.
+
+The state is held before it is published, after its flow id, with a
+release store, and flow_offload_route_release() puts it when the flow
+is freed, as for a state that nft_flow_route() attached. A full barrier
+orders it before NF_FLOW_HW_BIDIRECTIONAL. xfrm_input_deferred stays
+set: the software path hands a tuple to the slow path while either
+field is set, and a lockless reader that loaded xfrm_input before the
+store could otherwise load the flag after a clear and forward a packet
+of the reply direction in software, without the policy check. The GC
+reads xfrm_input once and sees either no state or a held one.
+
+The FLOW_CLS_REPLACE offers both directions again. A driver that holds
+the original direction refuses the second offer for its cookie, as on
+every flow_offload_refresh() and for every block callback after the
+first: airoha_ppe_flow_offload_replace() returns -EEXIST before it looks
+at the rule, and flow_offload_rule_add() does not count that. The reply
+direction is offered for the first time. If the driver refuses it, the
+reply direction keeps the CPU path, as for a flow that an authenticated
+reply created, and the stats and destroy requests for its cookie find no
+entry.
+
+The lookup costs one rhashtable lookup per packet of the reply
+direction that carries an admitted secpath and belongs to an offloaded
+connection on a hardware flowtable, which are the packets of the inbound
+direction that the CPU forwards. A deferred tuple of a software
+flowtable is left alone, as the software path treats both kinds alike.
+
+A failed offer of the reply direction is not retried, as for a flow
+that an authenticated reply created: the software path does not
+refresh a tuple with XFRM input metadata. Refreshing there would retry
+it, but it would also queue a FLOW_CLS_REPLACE every second for every
+inbound flow that the driver does not take, and extend flows by packets
+that have not passed the policy check yet.
+
+A packet of the reply direction of an offloaded connection that has
+already moved past ESTABLISHED, such as one whose remote host shut down
+its sending side before the tuple was resolved, still reaches the
+resolver; a connection that is not established gets no flow.
+
+Signed-off-by: hurrhnn <hurrhnn@icmp.kr>
+---
+diff -urNp a/include/net/netfilter/nf_flow_table.h b/include/net/netfilter/nf_flow_table.h
+--- a/include/net/netfilter/nf_flow_table.h
++++ b/include/net/netfilter/nf_flow_table.h
+@@ -367,6 +367,10 @@ void nf_flow_offload_del(struct nf_flowt
+ 			 struct flow_offload *flow);
+ void nf_flow_offload_stats(struct nf_flowtable *flowtable,
+ 			   struct flow_offload *flow);
++int nf_flow_offload_xfrm_input_resolve(struct nf_flowtable *flowtable,
++				       struct flow_offload *flow,
++				       enum flow_offload_tuple_dir dir,
++				       struct xfrm_state *x, u32 flow_id);
+ 
+ void nf_flow_table_offload_flush(struct nf_flowtable *flowtable);
+ void nf_flow_table_offload_flush_cleanup(struct nf_flowtable *flowtable);
+diff -urNp a/net/netfilter/nf_flow_table_offload.c b/net/netfilter/nf_flow_table_offload.c
+--- a/net/netfilter/nf_flow_table_offload.c
++++ b/net/netfilter/nf_flow_table_offload.c
+@@ -1240,6 +1240,77 @@ void nf_flow_offload_add(struct nf_flowt
+ 	flow_offload_queue_work(offload);
+ }
+ 
++/**
++ * nf_flow_offload_xfrm_input_resolve - give a deferred tuple its input state
++ * @flowtable: flowtable that holds @flow
++ * @flow: hardware offloaded flow
++ * @dir: direction whose tuple deferred its XFRM input state
++ * @x: authenticated input state of a packet of @dir, held by the caller
++ * @flow_id: hardware flow id of that packet
++ *
++ * Attach @x and @flow_id to the deferred tuple, offload both directions
++ * from now on and queue a FLOW_CLS_REPLACE for them.
++ *
++ * Return: 0 on success, -EBUSY if other offload work of @flow is in flight
++ * or no memory is left for the work (a later packet may try again), or
++ * another negative error code if the tuple cannot or need not be resolved.
++ */
++int nf_flow_offload_xfrm_input_resolve(struct nf_flowtable *flowtable,
++				       struct flow_offload *flow,
++				       enum flow_offload_tuple_dir dir,
++				       struct xfrm_state *x, u32 flow_id)
++{
++	struct flow_offload_tuple *tuple = &flow->tuplehash[dir].tuple;
++	struct flow_offload_work *offload;
++
++	if (!nf_flowtable_hw_offload(flowtable) ||
++	    !test_bit(NF_FLOW_HW, &flow->flags) ||
++	    tuple->xmit_type == FLOW_OFFLOAD_XMIT_XFRM)
++		return -EOPNOTSUPP;
++
++	/* Own NF_FLOW_HW_PENDING before the tuple changes. Until the work
++	 * queued below has run, no other offload work of the flow reads the
++	 * tuple, no other resolver writes it, and the GC cannot queue the
++	 * FLOW_CLS_DESTROY that has to complete before it frees the flow.
++	 */
++	offload = nf_flow_offload_work_alloc(flowtable, flow, FLOW_CLS_REPLACE);
++	if (!offload)
++		return -EBUSY;
++
++	if (test_bit(NF_FLOW_TEARDOWN, &flow->flags) ||
++	    test_bit(NF_FLOW_CLOSING, &flow->flags) ||
++	    test_bit(NF_FLOW_HW_DYING, &flow->flags) ||
++	    !tuple->xfrm_input_deferred || tuple->xfrm_input) {
++		clear_bit(NF_FLOW_HW_PENDING, &flow->flags);
++		kfree(offload);
++		return -EALREADY;
++	}
++
++	/* The software path sends a tuple to the slow path while either
++	 * xfrm_input or xfrm_input_deferred is set. Keep the flag, so that a
++	 * lockless reader never sees both clear.
++	 */
++	xfrm_state_hold(x);
++	tuple->xfrm_input_flow_id = flow_id;
++	/* Publish the state after its flow id. */
++	smp_store_release(&tuple->xfrm_input, x);
++	/* Order the state before the flag, and so before the work below and
++	 * the GC pass that later frees the flow and puts the state.
++	 */
++	smp_mb__before_atomic();
++	set_bit(NF_FLOW_HW_BIDIRECTIONAL, &flow->flags);
++	WRITE_ONCE(flow->timeout,
++		   nf_flowtable_time_stamp + flow_offload_get_timeout(flow));
++
++	/* The other direction is offloaded again as well, which a driver
++	 * already holding it refuses, as on every flow_offload_refresh().
++	 */
++	flow_offload_queue_work(offload);
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(nf_flow_offload_xfrm_input_resolve);
++
+ void nf_flow_offload_del(struct nf_flowtable *flowtable,
+ 			 struct flow_offload *flow)
+ {
+diff -urNp a/net/netfilter/nft_flow_offload.c b/net/netfilter/nft_flow_offload.c
+--- a/net/netfilter/nft_flow_offload.c
++++ b/net/netfilter/nft_flow_offload.c
+@@ -160,6 +160,104 @@ static bool nft_flow_offload_bridge_ok(c
+ 	return true;
+ }
+ 
++/* A flow that a local host opens through a packet offload tunnel defers the
++ * input state of its reply tuple when a packet of that host creates it, see
++ * nft_flow_route(), and is offloaded in the original direction only.
++ * Give the deferred tuple the state of the first authenticated packet of the
++ * reply direction that reaches this expression, so that the reply direction
++ * is offloaded as well.
++ */
++static void nft_flow_offload_xfrm_resolve(const struct nft_pktinfo *pkt,
++					  struct nf_flowtable *flowtable,
++					  struct nf_conn *ct)
++{
++#if IS_ENABLED(CONFIG_XFRM)
++	const struct nf_conntrack_tuple *ctt =
++		&ct->tuplehash[IP_CT_DIR_REPLY].tuple;
++	struct flow_offload_tuple_rhash *tuplehash;
++	const struct net_device *in = nft_in(pkt);
++	struct flow_offload_tuple tuple = {};
++	struct xfrm_offload *xo;
++	struct flow_offload *flow;
++	struct sec_path *sp;
++	struct xfrm_state *x;
++	u32 genid;
++
++	if (!in)
++		return;
++
++	/* nft_flow_offload_skip() admits a packet with a secpath only for one
++	 * verified, policy checked inbound packet offload state, with the
++	 * current policy generation and a hardware flow id.
++	 */
++	sp = skb_sec_path(pkt->skb);
++	if (!sp || !nf_flowtable_hw_offload(flowtable))
++		return;
++
++	xo = xfrm_input_offload(pkt->skb);
++	if (!xo)
++		return;
++
++	x = sp->xvec[0];
++	if (READ_ONCE(x->km.state) != XFRM_STATE_VALID)
++		return;
++
++	/* Build the key from the conntrack tuple, as flow_offload_fill_dir()
++	 * does: NAT has already changed the packet in this hook. A deferred
++	 * tuple has no encapsulation, and its input device is the device of
++	 * the XFRM route, which the packet came in on.
++	 */
++	switch (ctt->src.l3num) {
++	case NFPROTO_IPV4:
++		tuple.src_v4 = ctt->src.u3.in;
++		tuple.dst_v4 = ctt->dst.u3.in;
++		break;
++	case NFPROTO_IPV6:
++		tuple.src_v6 = ctt->src.u3.in6;
++		tuple.dst_v6 = ctt->dst.u3.in6;
++		break;
++	default:
++		return;
++	}
++	tuple.l3proto = ctt->src.l3num;
++	tuple.l4proto = ctt->dst.protonum;
++	switch (ctt->dst.protonum) {
++	case IPPROTO_TCP:
++	case IPPROTO_UDP:
++		tuple.src_port = ctt->src.u.tcp.port;
++		tuple.dst_port = ctt->dst.u.tcp.port;
++		break;
++	}
++	tuple.iifidx = in->ifindex;
++
++	tuplehash = flow_offload_lookup(flowtable, &tuple);
++	if (!tuplehash || tuplehash->tuple.dir != FLOW_OFFLOAD_DIR_REPLY ||
++	    !tuplehash->tuple.xfrm_input_deferred ||
++	    READ_ONCE(tuplehash->tuple.xfrm_input))
++		return;
++
++	flow = container_of(tuplehash, struct flow_offload,
++			    tuplehash[FLOW_OFFLOAD_DIR_REPLY]);
++	if (flow->ct != ct)
++		return;
++
++	/* A flow from before a policy change is torn down, as the software
++	 * path would do; a packet checked before the change is ignored.
++	 */
++	genid = tuplehash->tuple.xfrm_policy_genid;
++	if (genid != xfrm_policy_generation(nft_net(pkt))) {
++		flow_offload_teardown(flow);
++		return;
++	}
++	if (genid != sp->policy_genid)
++		return;
++
++	nf_flow_offload_xfrm_input_resolve(flowtable, flow,
++					   FLOW_OFFLOAD_DIR_REPLY, x,
++					   xo->hw_flow_id);
++#endif
++}
++
+ static void nft_flow_offload_eval(const struct nft_expr *expr,
+ 				  struct nft_regs *regs,
+ 				  const struct nft_pktinfo *pkt)
+@@ -194,8 +292,17 @@ static void nft_flow_offload_eval(const
+ 		if (unlikely(tcph->fin || tcph->rst ||
+ 			     (tcph->syn && !tcph->ack)))
+ 			goto out;
+-		if (unlikely(!nf_conntrack_tcp_established(ct)))
++		if (unlikely(!nf_conntrack_tcp_established(ct))) {
++			u8 state = READ_ONCE(ct->proto.tcp.state);
++
++			if (routing && CTINFO2DIR(ctinfo) == IP_CT_DIR_REPLY &&
++			    state >= TCP_CONNTRACK_FIN_WAIT &&
++			    state <= TCP_CONNTRACK_TIME_WAIT &&
++			    test_bit(IPS_OFFLOAD_BIT, &ct->status))
++				nft_flow_offload_xfrm_resolve(pkt, flowtable,
++							      ct);
+ 			goto out;
++		}
+ 		break;
+ 	case IPPROTO_UDP:
+ 		break;
+@@ -226,8 +333,12 @@ static void nft_flow_offload_eval(const
+ 	if (!routing && !nft_flow_offload_bridge_ok(ct))
+ 		goto out;
+ 
+-	if (test_and_set_bit(IPS_OFFLOAD_BIT, &ct->status))
++	if (test_and_set_bit(IPS_OFFLOAD_BIT, &ct->status)) {
++		/* nft_flow_route() defers only the reply tuple. */
++		if (routing && CTINFO2DIR(ctinfo) == IP_CT_DIR_REPLY)
++			nft_flow_offload_xfrm_resolve(pkt, flowtable, ct);
+ 		goto out;
++	}
+ 
+ 	dir = CTINFO2DIR(ctinfo);
+ 	if (nft_flow_route(pkt, ct, &route, dir, priv->flowtable) < 0)

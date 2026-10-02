@@ -1,0 +1,307 @@
+From: hurrhnn <hurrhnn@icmp.kr>
+Date: Sat, 3 Oct 2026 05:20:31 +0900
+Subject: [PATCH] net: airoha: keep Ethernet probing when SOE init fails
+
+airoha_soe_init() runs after the whole Ethernet datapath is up, and any
+failure in it (SA table wipe timeout, missing IRQ, notifier registration)
+aborts airoha_probe(), so an optional crypto block takes every Ethernet
+port down with it. The datapath layout was meanwhile already committed to
+SOE from the DT node alone: soe_present only meant that the node is
+available, so the coherent SOE RX ring, the lossless TX ring, the moved
+LRO rings and the NAT-T IFC rule were set up for an engine that might
+never come up.
+
+Split SOE bring-up into two stages. airoha_soe_init() now runs right
+after the FE/PDMA/QDMA reset, before airoha_fe_init(), and holds every
+step that can fail. It maps the block, wipes the SA table, requests the
+IRQ and registers the netdev notifier inside a devres group, and on
+failure releases the whole group, so no IRQ, mapping, memory region or
+allocation is left behind and eth->soe stays NULL. Errors other than
+-EPROBE_DEFER are reported once and the probe continues without SOE.
+soe_present is derived from eth->soe, so it now means that SOE was
+initialised, and the SOE datapath layout is used only for an engine that
+is actually there. The new airoha_soe_start() enables the engine and its
+interrupts and registers the xfrm key manager after airoha_ppe_init(),
+keeping the existing hardware order; it cannot fail.
+airoha_soe_deinit() undoes the PPE quiesce and the policy registration
+only when airoha_soe_start() ran, so it is safe after either stage.
+airoha_soe_present() has no user left and is removed, and
+airoha_soe_ppe_adopt_quiesce() tolerates a missing provider. With the
+SOE node absent or disabled nothing changes: airoha_soe_init() returns
+before touching the hardware and airoha_soe_start() does nothing.
+
+Signed-off-by: hurrhnn <hurrhnn@icmp.kr>
+---
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -2430,9 +2430,18 @@ static int airoha_hw_init(struct platfor
+ 		return err;
+ 
+ 	msleep(20);
++	err = airoha_soe_init(eth);
++	if (err == -EPROBE_DEFER)
++		return err;
++	if (err)
++		dev_warn(eth->dev,
++			 "SOE unavailable, continuing without ESP offload: %pe\n",
++			 ERR_PTR(err));
++	eth->soe_present = !!eth->soe;
++
+ 	err = airoha_fe_init(eth);
+ 	if (err)
+-		return err;
++		goto error_soe_deinit;
+ 
+ 	for (i = 0; i < ARRAY_SIZE(eth->qdma); i++) {
+ 		err = airoha_qdma_init(pdev, eth, &eth->qdma[i]);
+@@ -2450,6 +2459,8 @@ static int airoha_hw_init(struct platfor
+ error:
+ 	for (i = 0; i < ARRAY_SIZE(eth->qdma); i++)
+ 		airoha_qdma_cleanup(&eth->qdma[i]);
++error_soe_deinit:
++	airoha_soe_deinit(eth);
+ 
+ 	return err;
+ }
+@@ -5183,15 +5194,12 @@ static int airoha_probe(struct platform_
+ 	eth->napi_dev->threaded = true;
+ 	strscpy(eth->napi_dev->name, "qdma_eth", sizeof(eth->napi_dev->name));
+ 	platform_set_drvdata(pdev, eth);
+-	eth->soe_present = airoha_soe_present(eth);
+ 
+ 	err = airoha_hw_init(pdev, eth);
+ 	if (err)
+ 		goto error_netdev_free;
+ 
+-	err = airoha_soe_init(eth);
+-	if (err)
+-		goto error_hw_cleanup;
++	airoha_soe_start(eth);
+ 
+ 	for (i = 0; i < ARRAY_SIZE(eth->qdma); i++)
+ 		airoha_qdma_start_napi(&eth->qdma[i]);
+@@ -5278,7 +5286,6 @@ error_unregister_netdevs:
+ 		}
+ 		airoha_metadata_dst_free(port);
+ 	}
+-error_hw_cleanup:
+ 	airoha_hw_cleanup(eth);
+ error_netdev_free:
+ 	free_netdev(eth->napi_dev);
+--- a/drivers/net/ethernet/airoha/airoha_soe.c
++++ b/drivers/net/ethernet/airoha/airoha_soe.c
+@@ -317,6 +317,7 @@ struct airoha_soe {
+ 	spinlock_t policy_lock; /* Protects policy generation and quiesce. */
+ 	refcount_t refcnt;
+ 	struct completion released;
++	bool started;
+ 	bool faulted;
+ 	bool dead;
+ 	u32 policy_generation;
+@@ -387,7 +388,7 @@ void airoha_soe_ppe_adopt_quiesce(struct
+ 	unsigned long flags;
+ 	bool adopted = false;
+ 
+-	if (!quiesced)
++	if (!soe || !quiesced)
+ 		return;
+ 
+ 	spin_lock_irqsave(&soe->state_lock, flags);
+@@ -3830,22 +3831,6 @@ static struct device_node *airoha_soe_fi
+ 	return NULL;
+ }
+ 
+-bool airoha_soe_present(struct airoha_eth *eth)
+-{
+-	struct device_node *np;
+-
+-	if (!eth)
+-		return false;
+-
+-	np = airoha_soe_find_node(eth);
+-	if (!np)
+-		return false;
+-
+-	of_node_put(np);
+-
+-	return true;
+-}
+-
+ int airoha_soe_init(struct airoha_eth *eth)
+ {
+ 	struct device *dev = eth->dev;
+@@ -3853,27 +3838,33 @@ int airoha_soe_init(struct airoha_eth *e
+ 	struct resource res;
+ 	struct airoha_soe *soe;
+ 	void __iomem *base;
+-	unsigned long flags;
++	void *group;
+ 	int irq, err;
+ 
+ 	np = airoha_soe_find_node(eth);
+ 	if (!np)
+ 		return 0;
+ 
++	group = devres_open_group(dev, NULL, GFP_KERNEL);
++	if (!group) {
++		err = -ENOMEM;
++		goto put_node;
++	}
++
+ 	err = of_address_to_resource(np, 0, &res);
+ 	if (err)
+-		goto put_node;
++		goto release_group;
+ 
+ 	base = devm_ioremap_resource(dev, &res);
+ 	if (IS_ERR(base)) {
+ 		err = PTR_ERR(base);
+-		goto put_node;
++		goto release_group;
+ 	}
+ 
+ 	soe = devm_kzalloc(dev, sizeof(*soe), GFP_KERNEL);
+ 	if (!soe) {
+ 		err = -ENOMEM;
+-		goto put_node;
++		goto release_group;
+ 	}
+ 
+ 	soe->eth = eth;
+@@ -3903,23 +3894,51 @@ int airoha_soe_init(struct airoha_eth *e
+ 	err = airoha_soe_wipe_hw(soe);
+ 	if (err) {
+ 		err = dev_err_probe(dev, err, "failed to wipe SOE SA table\n");
+-		goto put_node;
++		goto release_group;
+ 	}
+ 
+ 	irq = of_irq_get(np, 0);
+ 	if (irq < 0) {
+ 		err = dev_err_probe(dev, irq, "failed to get SOE IRQ\n");
+-		goto put_node;
++		goto release_group;
+ 	}
+ 
+ 	err = devm_request_irq(dev, irq, airoha_soe_irq_handler, 0,
+ 			       "airoha-soe", soe);
+ 	if (err) {
+ 		err = dev_err_probe(dev, err, "failed to request SOE IRQ\n");
+-		goto put_node;
++		goto release_group;
+ 	}
+ 	soe->irq = irq;
+ 
++	err = register_netdevice_notifier(&soe->netdev_nb);
++	if (err)
++		goto release_group;
++
++	devres_remove_group(dev, group);
++	eth->soe = soe;
++	of_node_put(np);
++
++	return 0;
++
++release_group:
++	devres_release_group(dev, group);
++put_node:
++	of_node_put(np);
++
++	return err;
++}
++
++void airoha_soe_start(struct airoha_eth *eth)
++{
++	struct airoha_soe *soe = eth->soe;
++	void __iomem *base;
++	unsigned long flags;
++
++	if (!soe)
++		return;
++
++	base = soe->base;
+ 	/* Error IRQs detect an overlap with CPU-submitted requests, while the
+ 	 * hard sequence threshold prevents non-ESN ESP sequence wrap.
+ 	 */
+@@ -3932,31 +3951,8 @@ int airoha_soe_init(struct airoha_eth *e
+ 	writel(AIROHA_SOE_INT_PACKET_ERROR | AIROHA_SOE_INT_SEQ_NUM_HARD,
+ 	       base + AIROHA_SOE_INT_EN);
+ 
+-	eth->soe = soe;
+-	err = register_netdevice_notifier(&soe->netdev_nb);
+-	if (err)
+-		goto clear_soe;
+ 	airoha_soe_policy_register(soe);
+-
+-	of_node_put(np);
+-
+-	return 0;
+-
+-clear_soe:
+-	eth->soe = NULL;
+-	spin_lock_irqsave(&soe->state_lock, flags);
+-	soe->dead = true;
+-	spin_unlock_irqrestore(&soe->state_lock, flags);
+-	airoha_soe_disable_hw(soe);
+-	synchronize_irq(soe->irq);
+-	cancel_work_sync(&soe->error_work);
+-	airoha_soe_cancel_seq_work(soe);
+-	cancel_work_sync(&soe->fault_work);
+-	writel(AIROHA_SOE_INT_ALL, base + AIROHA_SOE_INT_STS);
+-put_node:
+-	of_node_put(np);
+-
+-	return err;
++	soe->started = true;
+ }
+ 
+ void airoha_soe_deinit(struct airoha_eth *eth)
+@@ -3966,14 +3962,16 @@ void airoha_soe_deinit(struct airoha_eth
+ 
+ 	if (!soe)
+ 		return;
+-	airoha_soe_ppe_quiesce_persistent(soe);
++	if (soe->started)
++		airoha_soe_ppe_quiesce_persistent(soe);
+ 
+ 	spin_lock_irqsave(&soe->state_lock, flags);
+ 	soe->dead = true;
+ 	spin_unlock_irqrestore(&soe->state_lock, flags);
+ 	cancel_work_sync(&soe->bind_tx_work);
+ 	airoha_soe_purge_bind_tx(soe, NULL);
+-	airoha_soe_policy_unregister(soe);
++	if (soe->started)
++		airoha_soe_policy_unregister(soe);
+ 
+ 	writel(0, soe->base + AIROHA_SOE_INT_EN);
+ 	synchronize_irq(soe->irq);
+--- a/drivers/net/ethernet/airoha/airoha_soe.h
++++ b/drivers/net/ethernet/airoha/airoha_soe.h
+@@ -72,8 +72,8 @@ struct airoha_soe_ppe_info {
+ };
+ 
+ #if IS_ENABLED(CONFIG_NET_AIROHA_SOE)
+-bool airoha_soe_present(struct airoha_eth *eth);
+ int airoha_soe_init(struct airoha_eth *eth);
++void airoha_soe_start(struct airoha_eth *eth);
+ void airoha_soe_deinit(struct airoha_eth *eth);
+ bool airoha_soe_available(struct airoha_soe *soe);
+ u32 airoha_soe_features(struct airoha_soe *soe);
+@@ -113,14 +113,13 @@ airoha_soe_ppe_flow_pop_sa(struct airoha
+ struct airoha_soe_ppe_flow *
+ airoha_soe_ppe_flow_pop_all(struct airoha_soe *soe);
+ #else
+-static inline bool airoha_soe_present(struct airoha_eth *eth)
++static inline int airoha_soe_init(struct airoha_eth *eth)
+ {
+-	return false;
++	return 0;
+ }
+ 
+-static inline int airoha_soe_init(struct airoha_eth *eth)
++static inline void airoha_soe_start(struct airoha_eth *eth)
+ {
+-	return 0;
+ }
+ 
+ static inline void airoha_soe_deinit(struct airoha_eth *eth)

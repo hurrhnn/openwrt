@@ -678,14 +678,19 @@ define KernelPackage/airoha-eth
   SUBMENU:=$(NETWORK_DEVICES_MENU)
   TITLE:=Airoha SoC Gigabit Ethernet support
   DEPENDS:=@TARGET_airoha +kmod-airoha-npu +kmod-of-mdio
-  KCONFIG:=CONFIG_NET_AIROHA
+  KCONFIG:= \
+	CONFIG_NET_AIROHA \
+	CONFIG_NET_AIROHA_SOE=y
   FILES:=$(LINUX_DIR)/drivers/net/ethernet/airoha/airoha-eth.ko
   AUTOLOAD:=$(call AutoLoad,41,airoha-eth,1)
 endef
 
 define KernelPackage/airoha-eth/description
   Kernel module for Airoha SoC Gigabit Ethernet.
-  Includes PPE (Packet Processing Engine) for hardware offloading.
+  Includes PPE (Packet Processing Engine) for hardware offloading and
+  the SOE (Secure Offload Engine) ESP packet offload provider. SOE stays
+  inactive unless the board DT enables the soe node; ESP packet offload
+  additionally needs kmod-ipsec4-offload and an IKE daemon.
 endef
 
 $(eval $(call KernelPackage,airoha-eth))

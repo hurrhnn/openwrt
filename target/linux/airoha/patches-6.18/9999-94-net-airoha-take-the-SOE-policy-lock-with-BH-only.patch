@@ -1,0 +1,119 @@
+From: hurrhnn <hurrhnn@icmp.kr>
+Date: Sat, 3 Oct 2026 05:14:10 +0900
+Subject: [PATCH] net: airoha: take the SOE policy lock with BH only
+
+airoha_soe_policy_change() runs from the xfrm policy_change_begin and
+policy_changed callbacks. xfrm core invokes them with xfrm_policy_lock
+held through spin_lock_bh(), from process context (netlink policy
+updates, flush, migrate, default changes) or from the policy timer
+softirq. The function took soe->policy_lock with spin_lock_irqsave()
+and then called airoha_ppe_soe_quiesce(), whose spin_lock_bh() and
+spin_unlock_bh() on ppe_lock run local_bh_enable() with hard interrupts
+disabled. That trips the lockdep_assert_irqs_enabled() check in
+__local_bh_enable_ip() whenever a policy change has to quiesce the
+IPsec PPE path, and nests a BH-only lock inside an IRQ-disabled section.
+
+policy_lock is never taken from hard interrupt context or under an
+IRQ-safe lock. Its only other users are the policy work item and
+airoha_soe_ppe_available(), which the flowtable offload path reaches
+under flow_offload_mutex. Take it with spin_lock_bh() everywhere. This
+makes xfrm_policy_lock -> policy_lock -> ppe_lock a plain BH nesting
+with interrupts enabled in both caller contexts, while the policy
+generation, the change count and the quiesce decision stay serialized
+by the same lock.
+
+Signed-off-by: hurrhnn <hurrhnn@icmp.kr>
+---
+--- a/drivers/net/ethernet/airoha/airoha_soe.c
++++ b/drivers/net/ethernet/airoha/airoha_soe.c
+@@ -424,9 +424,9 @@ static bool airoha_soe_ppe_available(str
+ 	if (!available)
+ 		return false;
+ 
+-	spin_lock_irqsave(&soe->policy_lock, flags);
++	spin_lock_bh(&soe->policy_lock);
+ 	available = !soe->policy_quiesced;
+-	spin_unlock_irqrestore(&soe->policy_lock, flags);
++	spin_unlock_bh(&soe->policy_lock);
+ 	if (!available)
+ 		return false;
+ 
+@@ -1135,22 +1135,21 @@ static void airoha_soe_policy_work(struc
+ {
+ 	struct airoha_soe *soe =
+ 		container_of(work, struct airoha_soe, policy_work);
+-	unsigned long flags;
+ 	u32 generation;
+ 	int err;
+ 
+ 	for (;;) {
+-		spin_lock_irqsave(&soe->policy_lock, flags);
++		spin_lock_bh(&soe->policy_lock);
+ 		if (!soe->policy_quiesced) {
+-			spin_unlock_irqrestore(&soe->policy_lock, flags);
++			spin_unlock_bh(&soe->policy_lock);
+ 			return;
+ 		}
+ 		if (soe->policy_change_count) {
+-			spin_unlock_irqrestore(&soe->policy_lock, flags);
++			spin_unlock_bh(&soe->policy_lock);
+ 			return;
+ 		}
+ 		generation = soe->policy_generation;
+-		spin_unlock_irqrestore(&soe->policy_lock, flags);
++		spin_unlock_bh(&soe->policy_lock);
+ 
+ 		err = airoha_ppe_soe_flush_all(soe->eth, soe);
+ 		if (err) {
+@@ -1160,17 +1159,17 @@ static void airoha_soe_policy_work(struc
+ 			return;
+ 		}
+ 
+-		spin_lock_irqsave(&soe->policy_lock, flags);
++		spin_lock_bh(&soe->policy_lock);
+ 		if (generation != soe->policy_generation) {
+-			spin_unlock_irqrestore(&soe->policy_lock, flags);
++			spin_unlock_bh(&soe->policy_lock);
+ 			continue;
+ 		}
+ 		if (soe->policy_change_count) {
+-			spin_unlock_irqrestore(&soe->policy_lock, flags);
++			spin_unlock_bh(&soe->policy_lock);
+ 			return;
+ 		}
+ 		soe->policy_quiesced = false;
+-		spin_unlock_irqrestore(&soe->policy_lock, flags);
++		spin_unlock_bh(&soe->policy_lock);
+ 		airoha_ppe_soe_resume(soe->eth);
+ 		return;
+ 	}
+@@ -1179,18 +1178,16 @@ static void airoha_soe_policy_work(struc
+ static void airoha_soe_policy_change(struct net *net, bool complete)
+ {
+ 	struct airoha_soe *soe;
+-	unsigned long flags;
+ 
+ 	rcu_read_lock();
+ 	list_for_each_entry_rcu(soe, &airoha_soe_list, list) {
+ 		if (airoha_soe_available(soe)) {
+-			spin_lock_irqsave(&soe->policy_lock, flags);
++			spin_lock_bh(&soe->policy_lock);
+ 			soe->policy_generation++;
+ 			if (!complete) {
+ 				if (WARN_ON_ONCE(soe->policy_change_count ==
+ 						 UINT_MAX)) {
+-					spin_unlock_irqrestore(&soe->policy_lock,
+-							       flags);
++					spin_unlock_bh(&soe->policy_lock);
+ 					continue;
+ 				}
+ 				soe->policy_change_count++;
+@@ -1203,7 +1200,7 @@ static void airoha_soe_policy_change(str
+ 			if (complete && !soe->policy_change_count &&
+ 			    soe->policy_quiesced)
+ 				schedule_work(&soe->policy_work);
+-			spin_unlock_irqrestore(&soe->policy_lock, flags);
++			spin_unlock_bh(&soe->policy_lock);
+ 		}
+ 	}
+ 	rcu_read_unlock();

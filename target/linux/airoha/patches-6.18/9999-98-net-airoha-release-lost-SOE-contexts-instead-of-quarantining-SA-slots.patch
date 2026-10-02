@@ -1,0 +1,370 @@
+From: hurrhnn <hurrhnn@icmp.kr>
+Date: Sat, 3 Oct 2026 20:00:00 +0900
+Subject: [PATCH] net: airoha: release lost SOE contexts instead of quarantining SA slots
+
+Completions are matched with the oldest queued context of their SA. A
+completion that never reaches the CPU therefore leaves one context
+behind: every later completion consumes the context of the request
+before it, so the stale context is always the newest one and never
+ages past AIROHA_SOE_CTX_TIMEOUT while the SA is busy. Only a request
+of the same SA that is submitted after the timeout releases it, and a
+deleted SA, an idle SA and an inbound SA whose ESP flow the PPE has
+learned submit no further request. When such an SA is deleted, its
+drain waits for the context until the timeout, marks the slot
+quarantined and keeps it reserved until reboot, so every SA that lost
+a completion since its last idle period leaks one of the 32 SA slots.
+
+Completions can be lost without a trace. The QDMA RX path drops
+descriptors flagged as overflowed, descriptors with an invalid length
+and oversized frames on the SOE ring before it classifies the frame as
+an SOE completion, so these drops never release the context of the
+request. A completion that carries the success flag of the other
+direction, and a dropped completion that finds no SA or no queued
+context, are discarded silently. Requests and results can also be lost
+in the QDMA and PSE fabric, which the driver cannot observe.
+
+Classify SOE completions before the early RX checks so that every
+dropped SOE frame releases a context of its SA, and warn about
+completions that carry the other direction's success flag and about
+drops that release nothing.
+
+Release contexts older than AIROHA_SOE_CTX_TIMEOUT from a delayed work
+that runs every half timeout while any context is queued. This applies
+the rule of the submit path to SAs that submit nothing, so a lost
+completion no longer outlives the next idle period of its SA. A drain
+that still times out can only find contexts that have been queued for
+at least the timeout, since a dead SA queues no new request. Release
+them as lost, clear the SA and free its slot, and keep a slot reserved
+only when its SA cannot be cleared. Allocate slots next-fit and reuse a
+freed slot within twice the timeout only when no other slot is free,
+so a completion that arrives after all is dropped as an orphan instead
+of being matched with a context of a new SA.
+
+An inbound ESP packet that arrives while its SA already has the
+maximum number of requests in flight was dropped. Leave it to software
+XFRM, which already decrypts the packets of learned flows and shares
+the replay window of the state with the SOE path.
+
+Signed-off-by: hurrhnn <hurrhnn@icmp.kr>
+---
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -1305,10 +1305,19 @@ static int airoha_qdma_rx_process(struct
+ 		 */
+ 		soe_ring = eth->soe_present && qid == AIROHA_SOE_RX_RING;
+ #endif
++		len = FIELD_GET(QDMA_DESC_LEN_MASK, desc_ctrl);
++#if IS_REACHABLE(CONFIG_NET_AIROHA_SOE)
++		if (first_buf)
++			soe_pkt = airoha_soe_rx_is_completion(e->buf,
++							      min_t(u32, len,
++								    e->dma_len),
++							      msg0);
++		else
++			soe_pkt = !q->skb->dev;
++#endif
+ 		if (unlikely(desc_ctrl & QDMA_DESC_DROP_MASK))
+ 			goto free_frag;
+ 
+-		len = FIELD_GET(QDMA_DESC_LEN_MASK, desc_ctrl);
+ 		data_len = q->skb && !q->rx_coherent ?
+ 				   AIROHA_RX_LEN(q->buf_size) :
+ 				   e->dma_len;
+@@ -1318,13 +1327,6 @@ static int airoha_qdma_rx_process(struct
+ 		    (len > AIROHA_MAX_RX_SIZE ||
+ 		     (q->skb && q->skb->len > AIROHA_MAX_RX_SIZE - len)))
+ 			goto free_frag;
+-#if IS_REACHABLE(CONFIG_NET_AIROHA_SOE)
+-		if (first_buf)
+-			soe_pkt = airoha_soe_rx_is_completion(e->buf, len,
+-							      msg0);
+-		else
+-			soe_pkt = !q->skb->dev;
+-#endif
+ 
+ 		if (!soe_pkt) {
+ 			if (first_buf) {
+--- a/drivers/net/ethernet/airoha/airoha_soe.c
++++ b/drivers/net/ethernet/airoha/airoha_soe.c
+@@ -172,6 +172,8 @@
+ #define AIROHA_SOE_HOP_INFO_DECRYPT 3
+ #define AIROHA_SOE_SA_INFLIGHT_MAX 7
+ #define AIROHA_SOE_CTX_TIMEOUT HZ
++#define AIROHA_SOE_CTX_EXPIRE_INTERVAL (AIROHA_SOE_CTX_TIMEOUT / 2)
++#define AIROHA_SOE_SA_COOLDOWN (2 * AIROHA_SOE_CTX_TIMEOUT)
+ #define AIROHA_SOE_BIND_TX_MAX 1024
+ #define AIROHA_SOE_NATT_PORT 4500
+ 
+@@ -296,12 +298,16 @@ struct airoha_soe {
+ 	struct work_struct seq_work;
+ 	struct work_struct policy_work;
+ 	struct work_struct bind_tx_work;
++	struct delayed_work expire_work;
+ 	struct list_head ppe_flows;
+ 	struct list_head bind_tx_queue;
+ 
+ 	/* Serialize SA table programming and software slot ownership. */
+ 	struct mutex sa_lock;
+ 	unsigned long sa_map;
++	unsigned long sa_cooling;
++	unsigned long sa_released[AIROHA_SOE_NUM_SA];
++	unsigned int sa_next;
+ 	struct airoha_soe_sa __rcu *sa[AIROHA_SOE_NUM_SA];
+ 	atomic_t error_pending;
+ 	atomic_t error_sa_pending;
+@@ -1783,6 +1789,33 @@ airoha_soe_ppe_resolve_conflicts_locked(
+ 	spin_unlock_bh(&remaining->lock);
+ }
+ 
++static int airoha_soe_find_free_slot_locked(struct airoha_soe *soe)
++{
++	int cooling = -1;
++	unsigned int n;
++
++	lockdep_assert_held(&soe->sa_lock);
++
++	for (n = 0; n < AIROHA_SOE_NUM_SA; n++) {
++		unsigned int i = (soe->sa_next + n) % AIROHA_SOE_NUM_SA;
++
++		if (soe->sa_map & BIT(i))
++			continue;
++		if (!(soe->sa_cooling & BIT(i)))
++			return i;
++		if (time_after_eq(jiffies, soe->sa_released[i] +
++					   AIROHA_SOE_SA_COOLDOWN)) {
++			soe->sa_cooling &= ~BIT(i);
++			return i;
++		}
++		if (cooling < 0 || time_before(soe->sa_released[i],
++					       soe->sa_released[cooling]))
++			cooling = i;
++	}
++
++	return cooling;
++}
++
+ static int airoha_soe_alloc_sa(struct airoha_soe *soe, struct xfrm_state *x,
+ 			       struct netlink_ext_ack *extack,
+ 			       struct airoha_soe_sa **sa)
+@@ -1790,6 +1823,7 @@ static int airoha_soe_alloc_sa(struct ai
+ 	struct airoha_soe_sa_cfg cfg = {};
+ 	struct airoha_soe_sa *new_sa;
+ 	unsigned int i;
++	int slot;
+ 	int err;
+ 
+ 	if (!soe || !sa || !airoha_soe_available(soe)) {
+@@ -1818,15 +1852,13 @@ static int airoha_soe_alloc_sa(struct ai
+ 		kfree(new_sa);
+ 		return -ENODEV;
+ 	}
+-	for (i = 0; i < AIROHA_SOE_NUM_SA; i++) {
+-		if (!(soe->sa_map & BIT(i)))
+-			break;
+-	}
+-	if (i == AIROHA_SOE_NUM_SA) {
++	slot = airoha_soe_find_free_slot_locked(soe);
++	if (slot < 0) {
+ 		mutex_unlock(&soe->sa_lock);
+ 		kfree(new_sa);
+ 		return -ENOSPC;
+ 	}
++	i = slot;
+ 
+ 	err = airoha_soe_program_sa_locked(soe, i, &cfg, true);
+ 	if (!err && !airoha_soe_available(soe)) {
+@@ -1870,6 +1902,8 @@ static int airoha_soe_alloc_sa(struct ai
+ 			err);
+ 	rcu_assign_pointer(soe->sa[i], new_sa);
+ 	soe->sa_map |= BIT(i);
++	soe->sa_cooling &= ~BIT(i);
++	soe->sa_next = (i + 1) % AIROHA_SOE_NUM_SA;
+ 	mutex_unlock(&soe->sa_lock);
+ 
+ 	*sa = new_sa;
+@@ -1982,8 +2016,9 @@ static void airoha_soe_detach_queued_ctx
+ 		airoha_soe_active_ctx_sub(sa->soe, detached);
+ }
+ 
+-static void airoha_soe_abort_queued_ctx(struct airoha_soe_sa *sa)
++static unsigned int airoha_soe_abort_queued_ctx(struct airoha_soe_sa *sa)
+ {
++	unsigned int detached;
+ 	LIST_HEAD(rx_queue);
+ 	LIST_HEAD(tx_queue);
+ 
+@@ -1992,13 +2027,17 @@ static void airoha_soe_abort_queued_ctx(
+ 	 * queue and discards its orphaned result.
+ 	 */
+ 	airoha_soe_detach_queued_ctx(sa, &tx_queue, &rx_queue);
++	detached = list_count_nodes(&tx_queue) + list_count_nodes(&rx_queue);
+ 	airoha_soe_purge_ctx_list(&tx_queue);
+ 	airoha_soe_purge_ctx_list(&rx_queue);
++
++	return detached;
+ }
+ 
+ static int airoha_soe_deactivate_sa(struct airoha_soe_sa *sa)
+ {
+ 	struct airoha_soe *soe;
++	unsigned int lost;
+ 	bool timed_out;
+ 	bool removed = false;
+ 	int ppe_err;
+@@ -2018,13 +2057,6 @@ static int airoha_soe_deactivate_sa(stru
+ 	    (rcu_access_pointer(soe->sa[sa->index]) == sa ||
+ 	     (!rcu_access_pointer(soe->sa[sa->index]) &&
+ 	      (soe->sa_map & BIT(sa->index)) && !sa->hw_cleared))) {
+-		if (timed_out) {
+-			sa->quarantined = true;
+-			dev_warn(soe->dev,
+-				 "SOE SA %u drain timed out; quarantining slot\n",
+-				 sa->index);
+-		}
+-
+ 		err = airoha_soe_clear_sa_locked(soe, sa->index);
+ 		if (err)
+ 			err = airoha_soe_clear_sa_locked(soe, sa->index);
+@@ -2054,7 +2086,11 @@ static int airoha_soe_deactivate_sa(stru
+ 		synchronize_rcu();
+ 
+ 	if (timed_out) {
+-		airoha_soe_abort_queued_ctx(sa);
++		lost = airoha_soe_abort_queued_ctx(sa);
++		dev_warn(soe->dev,
++			 "SOE SA %u (%s) drain timed out; releasing %u lost contexts\n",
++			 sa->index,
++			 sa->cmd & AIROHA_SOE_SA_CMD_ENC ? "out" : "in", lost);
+ 		/* Contexts already popped by NAPI still own @sa until finish_ctx(). */
+ 		wait_for_completion(&sa->idle);
+ 	}
+@@ -2095,6 +2131,8 @@ static void airoha_soe_free_sa(struct ai
+ 	    !rcu_access_pointer(soe->sa[sa->index]) && sa->hw_cleared &&
+ 	    !sa->quarantined) {
+ 		soe->sa_map &= ~BIT(sa->index);
++		soe->sa_released[sa->index] = jiffies;
++		soe->sa_cooling |= BIT(sa->index);
+ 	} else {
+ 		dev_warn(soe->dev, "quarantining SOE SA slot %u\n",
+ 			 sa->index);
+@@ -2176,6 +2214,32 @@ static void airoha_soe_expire_ctx(struct
+ 	airoha_soe_discard_ctx_list(sa, &expired);
+ }
+ 
++static void airoha_soe_expire_work(struct work_struct *work)
++{
++	struct airoha_soe *soe = container_of(to_delayed_work(work),
++					      struct airoha_soe, expire_work);
++	unsigned int i;
++
++	if (!airoha_soe_available(soe) || !atomic_read(&soe->queued_ctx))
++		return;
++
++	rcu_read_lock();
++	for (i = 0; i < AIROHA_SOE_NUM_SA; i++) {
++		struct airoha_soe_sa *sa = rcu_dereference(soe->sa[i]);
++
++		if (!sa)
++			continue;
++
++		airoha_soe_expire_ctx(sa, &sa->tx_queue);
++		airoha_soe_expire_ctx(sa, &sa->rx_queue);
++	}
++	rcu_read_unlock();
++
++	if (atomic_read(&soe->queued_ctx))
++		schedule_delayed_work(&soe->expire_work,
++				      AIROHA_SOE_CTX_EXPIRE_INTERVAL);
++}
++
+ static int airoha_soe_prepare_ip_headers(struct sk_buff *skb)
+ {
+ 	unsigned int hdr_len;
+@@ -2367,7 +2431,9 @@ airoha_soe_submit_prepared_skb(struct ai
+ 	ctx->submitted = jiffies;
+ 	list_add_tail(&ctx->list, head);
+ 	sa->inflight++;
+-	atomic_inc(&sa->soe->queued_ctx);
++	if (atomic_inc_return(&sa->soe->queued_ctx) == 1)
++		schedule_delayed_work(&sa->soe->expire_work,
++				      AIROHA_SOE_CTX_EXPIRE_INTERVAL);
+ 	atomic_inc(&sa->soe->active_ctx);
+ 	reinit_completion(&sa->idle);
+ 	spin_unlock_irqrestore(&sa->soe->seq_lock, flags);
+@@ -2710,6 +2776,9 @@ bool airoha_soe_rx_plain_skb(struct airo
+ 		return false;
+ 	}
+ 
++	if (READ_ONCE(sa->inflight) >= AIROHA_SOE_SA_INFLIGHT_MAX)
++		goto put_state;
++
+ 	ctx = kzalloc_obj(*ctx, GFP_ATOMIC);
+ 	if (!ctx)
+ 		goto put_state;
+@@ -2930,6 +2999,15 @@ bool airoha_soe_rx_skb(struct airoha_soe
+ 			       AIROHA_SOE_HOP_FLAG_DECRYPTED;
+ 	if (hop_flags != success_flag) {
+ 		rcu_read_unlock();
++		if (hop_flags == (dir == AIROHA_SOE_CTX_OUT ?
++				  AIROHA_SOE_HOP_FLAG_DECRYPTED :
++				  AIROHA_SOE_HOP_FLAG_ENCRYPTED))
++			dev_warn_ratelimited(soe->dev,
++					     "SOE SA %u %s completion carries hop flags %#x of the other direction\n",
++					     completion_tag,
++					     dir == AIROHA_SOE_CTX_OUT ?
++					     "outbound" : "inbound",
++					     hop_flags);
+ 		airoha_soe_rx_drop(soe, completion_tag);
+ 		kfree_skb(skb);
+ 		return true;
+@@ -2962,21 +3040,31 @@ bool airoha_soe_rx_drop(struct airoha_so
+ 	struct airoha_soe_ctx *ctx;
+ 	struct airoha_soe_sa *sa;
+ 
+-	if (!soe || completion_tag >= AIROHA_SOE_NUM_SA)
++	if (!soe)
+ 		return false;
+ 
+ 	rcu_read_lock();
+-	sa = rcu_dereference(soe->sa[completion_tag]);
++	sa = completion_tag < AIROHA_SOE_NUM_SA ?
++	     rcu_dereference(soe->sa[completion_tag]) : NULL;
+ 	if (!sa) {
+ 		rcu_read_unlock();
++		dev_warn_ratelimited(soe->dev,
++				     "dropped SOE completion tag %#x has no SA\n",
++				     completion_tag);
+ 		return false;
+ 	}
+ 	dir = sa->cmd & AIROHA_SOE_SA_CMD_ENC ? AIROHA_SOE_CTX_OUT :
+ 						       AIROHA_SOE_CTX_IN;
+ 	ctx = airoha_soe_pop_ctx(sa, dir);
+ 	rcu_read_unlock();
+-	if (!ctx)
++	if (!ctx) {
++		dev_warn_ratelimited(soe->dev,
++				     "SOE SA %u dropped completion has no queued %s context\n",
++				     completion_tag,
++				     dir == AIROHA_SOE_CTX_OUT ? "outbound" :
++								    "inbound");
+ 		return true;
++	}
+ 	list_add_tail(&ctx->list, &discarded);
+ 	airoha_soe_discard_ctx_list(sa, &discarded);
+ 
+@@ -3777,6 +3865,7 @@ int airoha_soe_init(struct airoha_eth *e
+ 	INIT_WORK(&soe->seq_work, airoha_soe_seq_work);
+ 	INIT_WORK(&soe->policy_work, airoha_soe_policy_work);
+ 	INIT_WORK(&soe->bind_tx_work, airoha_soe_bind_tx_work);
++	INIT_DELAYED_WORK(&soe->expire_work, airoha_soe_expire_work);
+ 	soe->netdev_nb.notifier_call = airoha_soe_netdev_event;
+ 
+ 	err = airoha_soe_hw_reset(soe, np);
+@@ -3876,6 +3965,7 @@ void airoha_soe_deinit(struct airoha_eth
+ 
+ 	airoha_soe_put_ref(soe);
+ 	wait_for_completion(&soe->released);
++	cancel_delayed_work_sync(&soe->expire_work);
+ 	/* State teardown can fault and reschedule this work while refs drain. */
+ 	cancel_work_sync(&soe->bind_tx_work);
+ 	airoha_soe_purge_bind_tx(soe, NULL);

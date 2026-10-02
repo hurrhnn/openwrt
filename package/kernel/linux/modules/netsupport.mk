@@ -246,8 +246,7 @@ define KernelPackage/ipsec4
 	CONFIG_INET_AH \
 	CONFIG_INET_ESP \
 	CONFIG_INET_IPCOMP \
-	CONFIG_INET_XFRM_TUNNEL \
-	CONFIG_INET_ESP_OFFLOAD=n
+	CONFIG_INET_XFRM_TUNNEL
   FILES:=$(foreach mod,$(IPSEC4-m),$(LINUX_DIR)/net/$(mod).ko)
   AUTOLOAD:=$(call AutoLoad,32,$(notdir $(IPSEC4-m)))
 endef
@@ -262,6 +261,26 @@ define KernelPackage/ipsec4/description
 endef
 
 $(eval $(call KernelPackage,ipsec4))
+
+
+define KernelPackage/ipsec4-offload
+  SUBMENU:=$(NETWORK_SUPPORT_MENU)
+  TITLE:=IPsec ESP offload support (IPv4)
+  DEPENDS:=+kmod-ipsec4
+  KCONFIG:= \
+	CONFIG_XFRM_OFFLOAD=y \
+	CONFIG_INET_ESP_OFFLOAD
+  FILES:=$(LINUX_DIR)/net/ipv4/esp4_offload.ko
+  AUTOLOAD:=$(call AutoLoad,33,esp4_offload)
+endef
+
+define KernelPackage/ipsec4-offload/description
+ Kernel module for IPv4 ESP transformation offload support.
+ Required by XFRM crypto/packet offload drivers (e.g. Airoha SOE):
+ xfrm_dev_state_add() refuses a state whose type has no offload ops.
+endef
+
+$(eval $(call KernelPackage,ipsec4-offload))
 
 
 IPSEC6-m = \
