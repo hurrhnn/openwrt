@@ -1,0 +1,272 @@
+From: hurrhnn <hurrhnn@icmp.kr>
+Date: Sat, 10 Oct 2026 11:15:00 +0900
+Subject: [PATCH] netfilter: flowtable: record the FIN and RST of XFRM input tuples
+
+A flow becomes CLOSING on an RST or once both of its directions have
+sent a FIN, as nf_flow_state_check() records them. It never sees the
+packets of a tuple with XFRM input metadata: the software path hands
+them to the slow path before nf_flow_offload_forward(). The FIN and the
+RST that the tunnel side of a packet offload flow sends are therefore
+never recorded, and such a flow cannot become CLOSING through a normal
+close. Its hardware entries stay programmed until it idles out, and the
+resolver of a deferred input tuple can still offload the reply direction
+of a connection that has closed.
+
+Record them where the slow path offers the packet to the flowtable.
+nft_flow_offload_eval() runs after the forward policy check and
+conntrack have accepted the packet. Before nft_flow_offload_skip(),
+whose flow id, mark and policy_flowtable conditions only decide whether
+a flow may be offloaded and which most decrypted frames, a FIN among
+them, do not meet, check that the packet was authenticated: a secpath of
+one verified, policy-checked inbound packet offload state with the
+current policy generation and no outbound offload. For a FIN or an RST
+of such a packet of an offloaded TCP conntrack in a routing flowtable,
+look the flow up from the conntrack tuple of the packet's direction and
+its input device, as the resolver does, and record the FIN or the RST
+when the tuple found is the current or deferred XFRM input tuple of a
+flow of the same conntrack. A plaintext packet with the tuple of a
+tunnel flow fails the policy check and never gets there, so it cannot
+end the offload of the flow, which recording the FIN at the ingress
+hook, before that check, would allow. Like the resolver, the lookup
+expects the decrypted packets to come in on the device of the XFRM route
+of the tuple; where they do not, the FIN is not recorded and the flow
+keeps its hardware entry until it idles out, as before.
+
+conntrack sees every packet of an XFRM input tuple, so a FIN recorded
+there has already moved the conntrack entry past ESTABLISHED.
+flow_offload_fixup_ct() keeps that state and its timeout when such a
+flow is torn down before it becomes CLOSING, and moves the entry to
+TCP_CONNTRACK_CLOSE only for a FIN that conntrack has not seen.
+
+The FIN and RST bookkeeping of nf_flow_state_check() moves unchanged to
+nf_flow_tcp_fin_rst() in nf_flow_table.h, so that both modules use it,
+and the key building of the resolver moves to
+nft_flow_offload_xfrm_key().
+
+Signed-off-by: hurrhnn <hurrhnn@icmp.kr>
+---
+diff -urNp a/include/net/netfilter/nf_flow_table.h b/include/net/netfilter/nf_flow_table.h
+--- a/include/net/netfilter/nf_flow_table.h
++++ b/include/net/netfilter/nf_flow_table.h
+@@ -197,6 +197,26 @@ struct flow_offload {
+ 	struct rcu_head				rcu_head;
+ };
+ 
++static inline void nf_flow_tcp_fin_rst(struct flow_offload *flow,
++				       enum flow_offload_tuple_dir dir,
++				       bool fin, bool rst)
++{
++	if (fin) {
++		enum nf_flow_flags fin_flag = NF_FLOW_FIN_ORIGINAL;
++		enum nf_flow_flags peer_fin = NF_FLOW_FIN_REPLY;
++
++		if (dir == FLOW_OFFLOAD_DIR_REPLY)
++			swap(fin_flag, peer_fin);
++
++		if (!test_and_set_bit(fin_flag, &flow->flags) &&
++		    test_bit(peer_fin, &flow->flags))
++			set_bit(NF_FLOW_CLOSING, &flow->flags);
++	}
++
++	if (rst && !test_bit(NF_FLOW_CLOSING, &flow->flags))
++		set_bit(NF_FLOW_CLOSING, &flow->flags);
++}
++
+ #define NF_FLOW_TIMEOUT (30 * HZ)
+ #define nf_flowtable_time_stamp	(u32)jiffies
+ 
+diff -urNp a/net/netfilter/nf_flow_table_core.c b/net/netfilter/nf_flow_table_core.c
+--- a/net/netfilter/nf_flow_table_core.c
++++ b/net/netfilter/nf_flow_table_core.c
+@@ -237,8 +237,10 @@ static void flow_offload_fixup_ct(struct
+ 		 * the last seen TCP state.
+ 		 */
+ 		closing = test_bit(NF_FLOW_CLOSING, &flow->flags) ||
+-			  test_bit(NF_FLOW_FIN_ORIGINAL, &flow->flags) ||
+-			  test_bit(NF_FLOW_FIN_REPLY, &flow->flags);
++			  ((test_bit(NF_FLOW_FIN_ORIGINAL, &flow->flags) ||
++			    test_bit(NF_FLOW_FIN_REPLY, &flow->flags)) &&
++			   READ_ONCE(ct->proto.tcp.state) <
++			   TCP_CONNTRACK_FIN_WAIT);
+ 		if (closing) {
+ 			flow_offload_fixup_tcp(ct, TCP_CONNTRACK_CLOSE);
+ 			timeout = READ_ONCE(tn->timeouts[TCP_CONNTRACK_CLOSE]);
+diff -urNp a/net/netfilter/nf_flow_table_ip.c b/net/netfilter/nf_flow_table_ip.c
+--- a/net/netfilter/nf_flow_table_ip.c
++++ b/net/netfilter/nf_flow_table_ip.c
+@@ -37,20 +37,7 @@ static int nf_flow_state_check(struct fl
+ 		return -1;
+ 	}
+ 
+-	if (tcph->fin) {
+-		enum nf_flow_flags fin = NF_FLOW_FIN_ORIGINAL;
+-		enum nf_flow_flags peer_fin = NF_FLOW_FIN_REPLY;
+-
+-		if (dir == FLOW_OFFLOAD_DIR_REPLY)
+-			swap(fin, peer_fin);
+-
+-		if (!test_and_set_bit(fin, &flow->flags) &&
+-		    test_bit(peer_fin, &flow->flags))
+-			set_bit(NF_FLOW_CLOSING, &flow->flags);
+-	}
+-
+-	if (tcph->rst && !test_bit(NF_FLOW_CLOSING, &flow->flags))
+-		set_bit(NF_FLOW_CLOSING, &flow->flags);
++	nf_flow_tcp_fin_rst(flow, dir, tcph->fin, tcph->rst);
+ 
+ 	return 0;
+ }
+diff -urNp a/net/netfilter/nft_flow_offload.c b/net/netfilter/nft_flow_offload.c
+--- a/net/netfilter/nft_flow_offload.c
++++ b/net/netfilter/nft_flow_offload.c
+@@ -160,6 +160,41 @@ static bool nft_flow_offload_bridge_ok(c
+ 	return true;
+ }
+ 
++#if IS_ENABLED(CONFIG_XFRM)
++static bool nft_flow_offload_xfrm_key(const struct nf_conn *ct,
++				      enum ip_conntrack_dir dir,
++				      const struct net_device *in,
++				      struct flow_offload_tuple *tuple)
++{
++	const struct nf_conntrack_tuple *ctt = &ct->tuplehash[dir].tuple;
++
++	switch (ctt->src.l3num) {
++	case NFPROTO_IPV4:
++		tuple->src_v4 = ctt->src.u3.in;
++		tuple->dst_v4 = ctt->dst.u3.in;
++		break;
++	case NFPROTO_IPV6:
++		tuple->src_v6 = ctt->src.u3.in6;
++		tuple->dst_v6 = ctt->dst.u3.in6;
++		break;
++	default:
++		return false;
++	}
++	tuple->l3proto = ctt->src.l3num;
++	tuple->l4proto = ctt->dst.protonum;
++	switch (ctt->dst.protonum) {
++	case IPPROTO_TCP:
++	case IPPROTO_UDP:
++		tuple->src_port = ctt->src.u.tcp.port;
++		tuple->dst_port = ctt->dst.u.tcp.port;
++		break;
++	}
++	tuple->iifidx = in->ifindex;
++
++	return true;
++}
++#endif
++
+ /* A flow that a local host opens through a packet offload tunnel defers the
+  * input state of its reply tuple when a packet of that host creates it, see
+  * nft_flow_route(), and is offloaded in the original direction only.
+@@ -172,8 +207,6 @@ static void nft_flow_offload_xfrm_resolv
+ 					  struct nf_conn *ct)
+ {
+ #if IS_ENABLED(CONFIG_XFRM)
+-	const struct nf_conntrack_tuple *ctt =
+-		&ct->tuplehash[IP_CT_DIR_REPLY].tuple;
+ 	struct flow_offload_tuple_rhash *tuplehash;
+ 	const struct net_device *in = nft_in(pkt);
+ 	struct flow_offload_tuple tuple = {};
+@@ -207,28 +240,8 @@ static void nft_flow_offload_xfrm_resolv
+ 	 * tuple has no encapsulation, and its input device is the device of
+ 	 * the XFRM route, which the packet came in on.
+ 	 */
+-	switch (ctt->src.l3num) {
+-	case NFPROTO_IPV4:
+-		tuple.src_v4 = ctt->src.u3.in;
+-		tuple.dst_v4 = ctt->dst.u3.in;
+-		break;
+-	case NFPROTO_IPV6:
+-		tuple.src_v6 = ctt->src.u3.in6;
+-		tuple.dst_v6 = ctt->dst.u3.in6;
+-		break;
+-	default:
++	if (!nft_flow_offload_xfrm_key(ct, IP_CT_DIR_REPLY, in, &tuple))
+ 		return;
+-	}
+-	tuple.l3proto = ctt->src.l3num;
+-	tuple.l4proto = ctt->dst.protonum;
+-	switch (ctt->dst.protonum) {
+-	case IPPROTO_TCP:
+-	case IPPROTO_UDP:
+-		tuple.src_port = ctt->src.u.tcp.port;
+-		tuple.dst_port = ctt->dst.u.tcp.port;
+-		break;
+-	}
+-	tuple.iifidx = in->ifindex;
+ 
+ 	tuplehash = flow_offload_lookup(flowtable, &tuple);
+ 	if (!tuplehash || tuplehash->tuple.dir != FLOW_OFFLOAD_DIR_REPLY ||
+@@ -258,6 +271,59 @@ static void nft_flow_offload_xfrm_resolv
+ #endif
+ }
+ 
++static void nft_flow_offload_xfrm_fin_rst(const struct nft_pktinfo *pkt,
++					  struct nf_flowtable *flowtable)
++{
++#if IS_ENABLED(CONFIG_XFRM)
++	struct sec_path *sp = skb_sec_path(pkt->skb);
++	struct flow_offload_tuple_rhash *tuplehash;
++	const struct net_device *in = nft_in(pkt);
++	struct flow_offload_tuple tuple = {};
++	enum ip_conntrack_info ctinfo;
++	struct tcphdr _tcph, *tcph;
++	enum ip_conntrack_dir dir;
++	struct flow_offload *flow;
++	struct xfrm_state *x;
++	struct nf_conn *ct;
++
++	if (!sp || !in || sp->len != 1 || sp->olen ||
++	    sp->verified_cnt != sp->len || !sp->policy_checked)
++		return;
++
++	x = sp->xvec[0];
++	if (sp->policy_genid != xfrm_policy_generation(xs_net(x)) ||
++	    x->xso.type != XFRM_DEV_OFFLOAD_PACKET ||
++	    x->xso.dir != XFRM_DEV_OFFLOAD_IN || !x->xso.dev)
++		return;
++
++	ct = nf_ct_get(pkt->skb, &ctinfo);
++	if (!ct || nf_ct_protonum(ct) != IPPROTO_TCP ||
++	    !test_bit(IPS_OFFLOAD_BIT, &ct->status))
++		return;
++
++	tcph = skb_header_pointer(pkt->skb, nft_thoff(pkt), sizeof(_tcph),
++				  &_tcph);
++	if (!tcph || !(tcph->fin || tcph->rst))
++		return;
++
++	dir = CTINFO2DIR(ctinfo);
++	if (!nft_flow_offload_xfrm_key(ct, dir, in, &tuple))
++		return;
++
++	tuplehash = flow_offload_lookup(flowtable, &tuple);
++	if (!tuplehash || tuplehash->tuple.dir != dir ||
++	    (!READ_ONCE(tuplehash->tuple.xfrm_input) &&
++	     !tuplehash->tuple.xfrm_input_deferred))
++		return;
++
++	flow = container_of(tuplehash, struct flow_offload, tuplehash[dir]);
++	if (flow->ct != ct)
++		return;
++
++	nf_flow_tcp_fin_rst(flow, tuplehash->tuple.dir, tcph->fin, tcph->rst);
++#endif
++}
++
+ static void nft_flow_offload_eval(const struct nft_expr *expr,
+ 				  struct nft_regs *regs,
+ 				  const struct nft_pktinfo *pkt)
+@@ -274,6 +340,9 @@ static void nft_flow_offload_eval(const
+ 	struct nf_conn *ct;
+ 	int ret;
+ 
++	if (routing)
++		nft_flow_offload_xfrm_fin_rst(pkt, flowtable);
++
+ 	if (nft_flow_offload_skip(pkt->skb, nft_pf(pkt)))
+ 		goto out;
+ 

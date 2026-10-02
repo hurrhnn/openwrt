@@ -1,0 +1,79 @@
+From: hurrhnn <hurrhnn@icmp.kr>
+Date: Sun, 4 Oct 2026 02:00:00 +0900
+Subject: [PATCH] netfilter: flowtable: clear IPS_OFFLOAD only on first teardown
+
+flow_offload_teardown() clears IPS_OFFLOAD_BIT of the conntrack on
+every call, while only the first call moves the flow to
+NF_FLOW_TEARDOWN. A torn down flow with a hardware entry is not freed
+by the GC pass that tears it down. It stays in the table until its
+FLOW_CLS_DESTROY work has completed, at least one more pass, and every
+pass in between calls flow_offload_teardown() again as long as the
+flow is expired, its route is stale or its conntrack is dying.
+
+In the meantime the next packet of the connection that takes the slow
+path sets the bit again and adds a new flow for the same tuple. The
+next repeated teardown of the old flow then clears the bit that the
+new, live flow holds, and the next slow path packet adds a second live
+flow for the tuple, as rhashtable_insert_fast() does not reject
+duplicate keys. When that duplicate is torn down in turn, it clears
+the bit of the live flow again, and the cycle repeats for as long as
+packets of the connection reach the slow path.
+
+With SOE packet offload on EN7581, a LAN host sent UDP datagrams into
+an ESP tunnel that arrived as two IP fragments each. The flowtable
+does not handle fragments, so every reassembled datagram reached the
+forward chain. The conntrack of the stream got one new flow_offload
+per GC tick, and each of them was destroyed again a few seconds later.
+The PPE never bound these duplicates, as the entry for the tuple
+belonged to the live flow, so their stats reported them idle and they
+expired. Every destroy of an SOE flow also quiesced the IPsec path of
+the PPE for all SAs.
+
+Clear the bit only when the flow enters NF_FLOW_TEARDOWN, and set that
+flag first, so that lookups already skip the flow by the time the slow
+path can add the next one. The bit is taken with test_and_set_bit() by
+the flow_offload expression, the FLOWOFFLOAD target and act_ct, which
+either insert a flow or clear the bit again when they fail. A flow
+enters NF_FLOW_TEARDOWN only in flow_offload_teardown() and is freed
+only after that, by the GC or by nf_flow_table_free(). Each flow thus
+releases the bit exactly once, while it still holds it: the bit is no
+longer cleared under a live flow, and it cannot stay set without a
+flow that will clear it. Later teardowns of the same flow return
+early, as they already skipped flow_offload_fixup_ct().
+
+The bit is still cleared before flow_offload_fixup_ct() updates the
+timeout of the conntrack. nf_flow_table_extend_ct_timeout() reads that
+timeout before it tests the bit, and extends a timeout below five
+minutes to a day while the bit is set. The test_and_set_bit() that sat
+between the clear and the update ordered the two, so add
+smp_mb__after_atomic() in its place. Without it, a GC pass that checks
+the flow while the packet path tears it down can see the shortened
+timeout with the bit still set and extend it to a day again.
+
+Signed-off-by: hurrhnn <hurrhnn@icmp.kr>
+---
+--- a/net/netfilter/nf_flow_table_core.c
++++ b/net/netfilter/nf_flow_table_core.c
+@@ -422,9 +422,20 @@ static void flow_offload_del(struct nf_f
+ 
+ void flow_offload_teardown(struct flow_offload *flow)
+ {
++	/* A torn down flow can stay in the table for several GC passes, and
++	 * by then IPS_OFFLOAD_BIT may belong to a new flow of the conntrack.
++	 * Only the first teardown releases the bit that this flow holds.
++	 */
++	if (test_and_set_bit(NF_FLOW_TEARDOWN, &flow->flags))
++		return;
++
+ 	clear_bit(IPS_OFFLOAD_BIT, &flow->ct->status);
+-	if (!test_and_set_bit(NF_FLOW_TEARDOWN, &flow->flags))
+-		flow_offload_fixup_ct(flow);
++	/* nf_flow_table_extend_ct_timeout() reads ct->timeout before it tests
++	 * the bit. Order the clear before the timeout update below, so that
++	 * the GC does not extend the new timeout to a day.
++	 */
++	smp_mb__after_atomic();
++	flow_offload_fixup_ct(flow);
+ }
+ EXPORT_SYMBOL_GPL(flow_offload_teardown);
+ 

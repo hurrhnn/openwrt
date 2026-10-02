@@ -1,0 +1,146 @@
+From: hurrhnn <hurrhnn@icmp.kr>
+Date: Sat, 3 Oct 2026 22:00:00 +0900
+Subject: [PATCH] net: airoha: bind outbound SOE flows in the PPE
+
+Every SOE SA is created with its PPE path disabled, so every IPsec
+packet makes a round trip through the CPU: a QDMA TX request to the
+SOE, a completion on the SOE RX ring, and the outer LOCAL_OUT or the
+inbound XFRM path. This round trip limits the IPsec rate, sends most
+outbound requests through the deferral worker and loses completions
+under load.
+
+Enable the PPE path of outbound SAs. The flowtable then binds the flows
+of an outbound SA in the PPE with the SOE hop, and the PPE hands their
+packets to the SOE and forwards the encrypted result itself. Packets of
+a flow that is not bound yet and packets that the PPE sends to the CPU
+still take the CPU path, and the bind barrier holds the binding of a
+flow until the CPU requests in flight have completed.
+
+Outbound SAs that use UDP encapsulation keep the CPU path.
+
+Inbound SAs stay PPE-disabled. The PPE binds an inbound SA as a single
+entry keyed on its outer ESP tuple that carries the egress of the first
+inner flow, so the packets of the SA would no longer pass the inbound
+policy check, the firewall or conntrack, the entry would outlive that
+flow, and anti-replay would rest on the replay window of the engine,
+which software never sees. Inbound ESP therefore stays with software
+XFRM and the SOE CPU path.
+
+Lower the number of requests an SA may have in flight from 7 to 4. The
+limit of 7 followed the 3-bit completion sequence that is no longer
+written to the hop descriptor. Fewer requests in flight lose fewer
+completions without lowering the rate of the CPU path. The same limit
+decides when inbound ESP is left to software XFRM.
+
+Bound outbound entries make two teardown paths reachable that only
+matter when an SA owns PPE flows:
+
+- When the bound entries of an SA cannot be invalidated before the SA
+  is freed, keep its slot reserved. A stale entry still carries the
+  slot as its SA index and would otherwise feed the next SA programmed
+  into that slot, possibly one toward another peer.
+- airoha_ppe_soe_forget_sa() now unlinks every flow of the SA from the
+  PPE hash lists, not only the inbound owner entries. A forgotten flow
+  keeps the SOE fields in its entry data, and a later learn event would
+  otherwise commit them as a plain entry, outside the bind barrier and
+  without an SA.
+
+The deferral worker, which now also carries the requests that the bind
+barrier holds back, submits a deferred request after it has released
+seq_lock and holds only a plain reference on the XFRM state.
+xfrm_dev_state_flush() deletes and frees the offload state of an SA that
+is still referenced, so a device going down could free the SA between
+the dequeue and the submit. Take an offload reference on the state for
+the submit, keep it until a request that has to wait again is back on
+the queue, where the SA teardown finds it, and drop the request when the
+state is no longer valid. xfrm_dev_state_free() waits for that
+reference before the driver frees the SA.
+
+Signed-off-by: hurrhnn <hurrhnn@icmp.kr>
+---
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -2545,12 +2545,10 @@ void airoha_ppe_soe_forget_sa(struct air
+ 		struct airoha_flow_table_entry *e;
+ 
+ 		e = container_of(flow, struct airoha_flow_table_entry, soe_flow);
+-		if (e->type == FLOW_TYPE_SOE_INPUT_OWNER) {
+-			spin_lock_bh(&ppe_lock);
+-			if (!hlist_unhashed(&e->list))
+-				hlist_del_init(&e->list);
+-			spin_unlock_bh(&ppe_lock);
+-		}
++		spin_lock_bh(&ppe_lock);
++		if (!hlist_unhashed(&e->list))
++			hlist_del_init(&e->list);
++		spin_unlock_bh(&ppe_lock);
+ 		airoha_ppe_soe_flow_release(flow);
+ 	}
+ 	mutex_unlock(&flow_offload_mutex);
+--- a/drivers/net/ethernet/airoha/airoha_soe.c
++++ b/drivers/net/ethernet/airoha/airoha_soe.c
+@@ -170,7 +170,7 @@
+ #define AIROHA_SOE_HOP_FLAG_DECRYPTED 4
+ #define AIROHA_SOE_HOP_INFO_ENCRYPT 2
+ #define AIROHA_SOE_HOP_INFO_DECRYPT 3
+-#define AIROHA_SOE_SA_INFLIGHT_MAX 7
++#define AIROHA_SOE_SA_INFLIGHT_MAX 4
+ #define AIROHA_SOE_CTX_TIMEOUT HZ
+ #define AIROHA_SOE_CTX_EXPIRE_INTERVAL (AIROHA_SOE_CTX_TIMEOUT / 2)
+ #define AIROHA_SOE_SA_COOLDOWN (2 * AIROHA_SOE_CTX_TIMEOUT)
+@@ -1889,7 +1889,7 @@ static int airoha_soe_alloc_sa(struct ai
+ 	new_sa->x = x;
+ 	new_sa->index = i;
+ 	new_sa->cmd = cfg.cmd;
+-	new_sa->ppe_disabled = true;
++	new_sa->ppe_disabled = !(cfg.cmd & AIROHA_SOE_SA_CMD_ENC) || x->encap;
+ 	spin_lock_init(&new_sa->lock);
+ 	INIT_LIST_HEAD(&new_sa->tx_queue);
+ 	INIT_LIST_HEAD(&new_sa->rx_queue);
+@@ -2511,6 +2511,7 @@ static void airoha_soe_bind_tx_work(stru
+ 		struct xfrm_state *x;
+ 		struct sk_buff *skb;
+ 		unsigned long flags;
++		bool held;
+ 		int err;
+ 
+ 		spin_lock_irqsave(&soe->seq_lock, flags);
+@@ -2536,10 +2537,12 @@ static void airoha_soe_bind_tx_work(stru
+ 		x = ctx->tx.deferred_x;
+ 		spin_unlock_irqrestore(&soe->seq_lock, flags);
+ 
+-		err = airoha_soe_submit_prepared_skb(sa, dev, skb, ctx, x,
+-						     true);
+-		if (!err)
+-			continue;
++		held = xfrm_dev_offload_get(x);
++		if (held)
++			err = airoha_soe_submit_prepared_skb(sa, dev, skb, ctx,
++							     x, true);
++		else
++			err = -ENOENT;
+ 		if (err == -EAGAIN) {
+ 			spin_lock_irqsave(&soe->seq_lock, flags);
+ 			ctx->tx.deferred_skb = skb;
+@@ -2549,8 +2552,13 @@ static void airoha_soe_bind_tx_work(stru
+ 			soe->bind_tx_queued++;
+ 			soe->bind_tx_draining = true;
+ 			spin_unlock_irqrestore(&soe->seq_lock, flags);
++			xfrm_dev_offload_put(x);
+ 			return;
+ 		}
++		if (held)
++			xfrm_dev_offload_put(x);
++		if (!err)
++			continue;
+ 
+ 		XFRM_INC_STATS(xs_net(x), LINUX_MIB_XFRMOUTERROR);
+ 		ctx->tx.deferred_skb = NULL;
+@@ -3250,6 +3258,7 @@ static void airoha_soe_xfrm_state_free(s
+ 				"failed to invalidate PPE flows before freeing SA %u; keeping IPsec PPE path disabled: %d\n",
+ 				state->sa->index, err);
+ 			airoha_ppe_soe_forget_sa(state->dev->eth, state->sa);
++			state->sa->quarantined = true;
+ 			airoha_soe_ppe_adopt_quiesce(state->soe,
+ 						     state->ppe_quiesced);
+ 			airoha_soe_ppe_adopt_quiesce(state->soe,

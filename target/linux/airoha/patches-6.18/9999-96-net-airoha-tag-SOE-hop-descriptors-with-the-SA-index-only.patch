@@ -1,0 +1,547 @@
+From: hurrhnn <hurrhnn@icmp.kr>
+Date: Sat, 3 Oct 2026 17:30:00 +0900
+Subject: [PATCH] net: airoha: tag SOE hop descriptors with the SA index only
+
+The SOE uses bits 7:5 of hop descriptor byte 28 when it computes the
+ESP integrity check value. The driver stored a per-request completion
+sequence in these bits, and the reserved value 7 for TCP and UDP
+packets that a bound PPE entry might consume. Only a zero value gives a
+valid ICV, so every packet submitted with a non-zero sequence and every
+untracked TCP or UDP packet left the engine with a correctly encrypted
+payload but an ICV that the peer rejects.
+
+Write only the SA index to byte 28 and match completions without a
+per-request tag. The requests of an SA are queued under sa->lock in the
+order in which they are handed to the single SOE QDMA TX ring, which
+feeds one PSE output queue per direction, and an SA is used in one
+direction only. Relying on the engine to return the results of a queue
+in that order, each completion is matched with the oldest queued
+context of its SA. A completion that the Ethernet driver drops still
+consumes the oldest context, so explicit drops keep the queue aligned.
+The limit of seven requests in flight per SA is kept.
+
+A context that has been queued for longer than one second is treated
+as lost and released before the next request of its SA is queued, and
+deferring a request now kicks the deferral worker, whose retry of the
+oldest deferred request releases the lost contexts of that request's
+SA. A completion that never arrives therefore can neither stall
+transmission nor shift the matching beyond the next idle period of its
+SA. A completion that finds no queued context cannot be told apart from
+the late result of such a context, so it is dropped instead of
+disabling the provider, and a tag that is not a valid SA index is not
+matched at all.
+
+An untracked request cannot be expressed anymore, so TCP and UDP
+packets are submitted like every other packet. A result consumed by a
+bound PPE entry never produces a CPU completion, and the PPE builds the
+hop of such packets itself, so mark every new SA as PPE-disabled.
+airoha_soe_ppe_flow_add() then refuses outbound and inbound SOE flows,
+no SOE flow is bound in the PPE and the bind barrier is never armed.
+Every submitted packet produces exactly one CPU completion.
+
+Signed-off-by: hurrhnn <hurrhnn@icmp.kr>
+---
+--- a/drivers/net/ethernet/airoha/airoha_soe.c
++++ b/drivers/net/ethernet/airoha/airoha_soe.c
+@@ -170,10 +170,8 @@
+ #define AIROHA_SOE_HOP_FLAG_DECRYPTED 4
+ #define AIROHA_SOE_HOP_INFO_ENCRYPT 2
+ #define AIROHA_SOE_HOP_INFO_DECRYPT 3
+-#define AIROHA_SOE_COMPLETION_SA_MASK GENMASK(4, 0)
+-#define AIROHA_SOE_COMPLETION_SEQ_MASK GENMASK(7, 5)
+-#define AIROHA_SOE_COMPLETION_SEQ_UNTRACKED 7
+-#define AIROHA_SOE_COMPLETION_SEQ_COUNT 7
++#define AIROHA_SOE_SA_INFLIGHT_MAX 7
++#define AIROHA_SOE_CTX_TIMEOUT HZ
+ #define AIROHA_SOE_BIND_TX_MAX 1024
+ #define AIROHA_SOE_NATT_PORT 4500
+ 
+@@ -196,7 +194,7 @@ struct airoha_soe_ctx {
+ 	struct list_head list;
+ 	struct sk_buff *metadata;
+ 	enum airoha_soe_ctx_dir dir;
+-	u8 completion_tag;
++	unsigned long submitted;
+ 	union {
+ 		struct {
+ 			struct dst_entry *dst;
+@@ -205,10 +203,8 @@ struct airoha_soe_ctx {
+ 			struct airoha_soe_sa *deferred_sa;
+ 			struct airoha_gdm_dev *deferred_dev;
+ 			struct xfrm_state *deferred_x;
+-			struct airoha_soe_ppe_flow_key ppe_key;
+ 			u32 tskey;
+ 			u8 tx_flags;
+-			bool ppe_key_valid;
+ 		} tx;
+ 		struct {
+ 			struct xfrm_state *x;
+@@ -242,7 +238,6 @@ struct airoha_soe_sa {
+ 	struct list_head ppe_flows;
+ 	struct completion idle;
+ 	unsigned int inflight;
+-	unsigned long completion_seq_map;
+ 	struct airoha_soe_ppe_key ppe_key;
+ 	bool hw_cleared;
+ 	bool quarantined;
+@@ -958,21 +953,6 @@ static bool airoha_soe_sa_has_queued_ctx
+ 	return queued;
+ }
+ 
+-static void
+-airoha_soe_fault_ambiguous_completion(struct airoha_soe *soe,
+-				      struct airoha_soe_sa *sa,
+-				      enum airoha_soe_ctx_dir dir)
+-{
+-	if (!airoha_soe_sa_has_queued_ctx(sa, dir) ||
+-	    !airoha_soe_mark_faulted(soe))
+-		return;
+-
+-	airoha_soe_disable_hw(soe);
+-	dev_err_ratelimited(soe->dev,
+-			    "SOE completion cannot be matched to a queued request; disabling provider\n");
+-	schedule_work(&soe->fault_work);
+-}
+-
+ static void airoha_soe_error_work(struct work_struct *work)
+ {
+ 	struct airoha_soe *soe =
+@@ -1877,6 +1857,7 @@ static int airoha_soe_alloc_sa(struct ai
+ 	new_sa->x = x;
+ 	new_sa->index = i;
+ 	new_sa->cmd = cfg.cmd;
++	new_sa->ppe_disabled = true;
+ 	spin_lock_init(&new_sa->lock);
+ 	INIT_LIST_HEAD(&new_sa->tx_queue);
+ 	INIT_LIST_HEAD(&new_sa->rx_queue);
+@@ -1989,7 +1970,6 @@ static void airoha_soe_detach_queued_ctx
+ 	queued = detached;
+ 	list_splice_tail_init(&sa->tx_queue, tx_queue);
+ 	list_splice_tail_init(&sa->rx_queue, rx_queue);
+-	sa->completion_seq_map = 0;
+ 	if (WARN_ON_ONCE(queued > sa->inflight))
+ 		queued = sa->inflight;
+ 	sa->inflight -= queued;
+@@ -2125,33 +2105,22 @@ static void airoha_soe_free_sa(struct ai
+ }
+ 
+ static struct airoha_soe_ctx *
+-airoha_soe_pop_ctx(struct airoha_soe_sa *sa, enum airoha_soe_ctx_dir dir,
+-		   u8 completion_tag)
++airoha_soe_pop_ctx(struct airoha_soe_sa *sa, enum airoha_soe_ctx_dir dir)
+ {
+-	struct airoha_soe_ctx *ctx, *match = NULL;
++	struct airoha_soe_ctx *ctx;
+ 	struct list_head *head;
+-	unsigned int seq;
+ 
+ 	head = dir == AIROHA_SOE_CTX_OUT ? &sa->tx_queue : &sa->rx_queue;
+ 
+ 	spin_lock_bh(&sa->lock);
+-	list_for_each_entry(ctx, head, list) {
+-		if (ctx->completion_tag == completion_tag) {
+-			match = ctx;
+-			break;
+-		}
+-	}
+-	if (match) {
+-		list_del_init(&match->list);
+-		seq = FIELD_GET(AIROHA_SOE_COMPLETION_SEQ_MASK,
+-				match->completion_tag);
+-		if (!WARN_ON_ONCE(!test_bit(seq, &sa->completion_seq_map)))
+-			__clear_bit(seq, &sa->completion_seq_map);
++	ctx = list_first_entry_or_null(head, struct airoha_soe_ctx, list);
++	if (ctx) {
++		list_del_init(&ctx->list);
+ 		atomic_dec(&sa->soe->queued_ctx);
+ 	}
+ 	spin_unlock_bh(&sa->lock);
+ 
+-	return match;
++	return ctx;
+ }
+ 
+ static void airoha_soe_discard_ctx_list(struct airoha_soe_sa *sa,
+@@ -2189,6 +2158,24 @@ static void airoha_soe_finish_ctx(struct
+ 		airoha_soe_active_ctx_sub(sa->soe, 1);
+ }
+ 
++static void airoha_soe_expire_ctx(struct airoha_soe_sa *sa,
++				  struct list_head *head)
++{
++	struct airoha_soe_ctx *ctx, *tmp;
++	LIST_HEAD(expired);
++
++	spin_lock_bh(&sa->lock);
++	list_for_each_entry_safe(ctx, tmp, head, list) {
++		if (time_before(jiffies,
++				ctx->submitted + AIROHA_SOE_CTX_TIMEOUT))
++			break;
++		list_move_tail(&ctx->list, &expired);
++		atomic_dec(&sa->soe->queued_ctx);
++	}
++	spin_unlock_bh(&sa->lock);
++	airoha_soe_discard_ctx_list(sa, &expired);
++}
++
+ static int airoha_soe_prepare_ip_headers(struct sk_buff *skb)
+ {
+ 	unsigned int hdr_len;
+@@ -2251,8 +2238,7 @@ static int airoha_soe_push_l2_header(str
+ }
+ 
+ static void airoha_soe_push_hop_desc(struct sk_buff *skb, unsigned int sa_index,
+-				     u8 completion_tag, bool encrypt,
+-				     u16 foe_hash, bool foe_valid)
++				     bool encrypt, u16 foe_hash, bool foe_valid)
+ {
+ 	u32 hop_direction = encrypt ? AIROHA_SOE_HOP_INFO_ENCRYPT :
+ 				      AIROHA_SOE_HOP_INFO_DECRYPT;
+@@ -2266,42 +2252,12 @@ static void airoha_soe_push_hop_desc(str
+ 	if (foe_valid)
+ 		desc[2] = cpu_to_le64((u64)foe_hash << 32);
+ 	desc[3] = cpu_to_le64(desc3);
+-	((u8 *)desc)[28] = completion_tag;
++	((u8 *)desc)[28] = sa_index;
+ 
+ 	/* The FE/QDMA hop descriptor is consumed by PSE port 7 before SOE. */
+ 	memcpy(skb_push(skb, AIROHA_SOE_QDMA_HOP_DESC_LEN), desc, sizeof(desc));
+ }
+ 
+-static bool airoha_soe_parse_ppe_flow_key(struct sk_buff *skb,
+-					  struct airoha_soe_ppe_flow_key *key)
+-{
+-	struct {
+-		__be16 source;
+-		__be16 dest;
+-	} *ports;
+-	struct iphdr *iph;
+-	unsigned int len;
+-
+-	iph = ip_hdr(skb);
+-	if ((u8 *)iph < skb->head || (u8 *)(iph + 1) > skb_tail_pointer(skb) ||
+-	    iph->version != 4 || iph->ihl < 5 || ip_is_fragment(iph) ||
+-	    (iph->protocol != IPPROTO_TCP && iph->protocol != IPPROTO_UDP))
+-		return false;
+-
+-	len = iph->ihl * 4 + sizeof(*ports);
+-	if ((u8 *)iph + len > skb_tail_pointer(skb))
+-		return false;
+-	ports = (void *)iph + iph->ihl * 4;
+-
+-	key->saddr = iph->saddr;
+-	key->daddr = iph->daddr;
+-	key->sport = ports->source;
+-	key->dport = ports->dest;
+-	key->l4proto = iph->protocol;
+-
+-	return true;
+-}
+-
+ static int
+ airoha_soe_defer_tx_locked(struct airoha_soe_sa *sa,
+ 			   struct airoha_gdm_dev *dev, struct sk_buff *skb,
+@@ -2330,6 +2286,7 @@ airoha_soe_defer_tx_locked(struct airoha
+ 	list_add_tail(&ctx->list, &soe->bind_tx_queue);
+ 	soe->bind_tx_queued++;
+ 	soe->bind_tx_draining = true;
++	schedule_work(&soe->bind_tx_work);
+ 
+ 	return 0;
+ }
+@@ -2346,9 +2303,7 @@ airoha_soe_submit_prepared_skb(struct ai
+ 			    AIROHA_SOE_QDMA_QUEUE_DECRYPT;
+ 	bool encrypt = ctx->dir == AIROHA_SOE_CTX_OUT;
+ 	struct list_head *head;
+-	unsigned int seq;
+ 	unsigned long flags;
+-	bool untracked;
+ 	u32 msg0, msg1;
+ 	int err;
+ 
+@@ -2367,6 +2322,7 @@ airoha_soe_submit_prepared_skb(struct ai
+ 		return -ENODEV;
+ 
+ 	head = ctx->dir == AIROHA_SOE_CTX_OUT ? &sa->tx_queue : &sa->rx_queue;
++	airoha_soe_expire_ctx(sa, head);
+ 	spin_lock_bh(&sa->lock);
+ 	spin_lock_irqsave(&sa->soe->seq_lock, flags);
+ 	if (sa->soe->seq_stopped) {
+@@ -2379,7 +2335,6 @@ airoha_soe_submit_prepared_skb(struct ai
+ 		spin_unlock_bh(&sa->lock);
+ 		return -ENOENT;
+ 	}
+-	untracked = ctx->dir == AIROHA_SOE_CTX_OUT && ctx->tx.ppe_key_valid;
+ 	if (ctx->dir == AIROHA_SOE_CTX_OUT &&
+ 	    (sa->soe->ppe_bind_active ||
+ 	     (!from_queue && sa->soe->bind_tx_draining))) {
+@@ -2391,70 +2346,44 @@ airoha_soe_submit_prepared_skb(struct ai
+ 		spin_unlock_bh(&sa->lock);
+ 		return err;
+ 	}
++	if (sa->inflight >= AIROHA_SOE_SA_INFLIGHT_MAX) {
++		if (ctx->dir == AIROHA_SOE_CTX_OUT && !from_queue)
++			err = airoha_soe_defer_tx_locked(sa, dev, skb, ctx, x);
++		else
++			err = -EAGAIN;
++		spin_unlock_irqrestore(&sa->soe->seq_lock, flags);
++		spin_unlock_bh(&sa->lock);
++		return err;
++	}
+ 	if (ctx->dir == AIROHA_SOE_CTX_OUT) {
+ 		ctx->tx.deferred_skb = NULL;
+ 		ctx->tx.deferred_sa = NULL;
+ 		ctx->tx.deferred_dev = NULL;
+ 	}
+-	if (untracked) {
+-		/* A bound PPE entry consumes the SOE result instead of returning
+-		 * it as a CPU completion. The bind barrier has already drained
+-		 * every tracked context, so submit packets which raced into the
+-		 * CPU path with the reserved completion tag.
+-		 */
+-		ctx->completion_tag =
+-			FIELD_PREP(AIROHA_SOE_COMPLETION_SA_MASK, sa->index) |
+-			FIELD_PREP(AIROHA_SOE_COMPLETION_SEQ_MASK,
+-				   AIROHA_SOE_COMPLETION_SEQ_UNTRACKED);
+-	} else {
+-		seq = find_first_zero_bit(&sa->completion_seq_map,
+-					  AIROHA_SOE_COMPLETION_SEQ_COUNT);
+-		if (seq == AIROHA_SOE_COMPLETION_SEQ_COUNT) {
+-			if (ctx->dir == AIROHA_SOE_CTX_OUT && !from_queue)
+-				err = airoha_soe_defer_tx_locked(sa, dev, skb, ctx,
+-								 x);
+-			else
+-				err = -EAGAIN;
+-			spin_unlock_irqrestore(&sa->soe->seq_lock, flags);
+-			spin_unlock_bh(&sa->lock);
+-			return err;
+-		}
+-		__set_bit(seq, &sa->completion_seq_map);
+-		ctx->completion_tag =
+-			FIELD_PREP(AIROHA_SOE_COMPLETION_SA_MASK, sa->index) |
+-			FIELD_PREP(AIROHA_SOE_COMPLETION_SEQ_MASK, seq);
+-	}
+-	airoha_soe_push_hop_desc(skb, sa->index, ctx->completion_tag, encrypt,
+-				 ctx->rx.foe_hash,
++	airoha_soe_push_hop_desc(skb, sa->index, encrypt, ctx->rx.foe_hash,
+ 				 ctx->dir == AIROHA_SOE_CTX_IN &&
+ 				 ctx->rx.foe_valid);
+ 
+-	if (!untracked) {
+-		list_add_tail(&ctx->list, head);
+-		sa->inflight++;
+-		atomic_inc(&sa->soe->queued_ctx);
+-		atomic_inc(&sa->soe->active_ctx);
+-		reinit_completion(&sa->idle);
+-	}
++	ctx->submitted = jiffies;
++	list_add_tail(&ctx->list, head);
++	sa->inflight++;
++	atomic_inc(&sa->soe->queued_ctx);
++	atomic_inc(&sa->soe->active_ctx);
++	reinit_completion(&sa->idle);
+ 	spin_unlock_irqrestore(&sa->soe->seq_lock, flags);
+ 
+ 	err = dev->soe_xmit_skb(dev, skb, msg0, msg1,
+ 				AIROHA_SOE_TXMSG2_DEFAULT);
+-	if (err && !untracked) {
++	if (err) {
+ 		list_del(&ctx->list);
+-		__clear_bit(FIELD_GET(AIROHA_SOE_COMPLETION_SEQ_MASK,
+-				      ctx->completion_tag),
+-			    &sa->completion_seq_map);
+ 		atomic_dec(&sa->soe->queued_ctx);
+ 		sa->inflight--;
+ 		if (sa->dead && !sa->inflight)
+ 			complete(&sa->idle);
+ 	}
+ 	spin_unlock_bh(&sa->lock);
+-	if (err && !untracked)
++	if (err)
+ 		airoha_soe_active_ctx_sub(sa->soe, 1);
+-	if (!err && untracked)
+-		airoha_soe_free_ctx(ctx);
+ 
+ 	return err;
+ }
+@@ -2598,8 +2527,6 @@ int airoha_soe_xmit(struct airoha_soe_sa
+ 	ctx->tx.sk = sk;
+ 	ctx->tx.tskey = skb_shinfo(skb)->tskey;
+ 	ctx->tx.tx_flags = skb_shinfo(skb)->tx_flags;
+-	ctx->tx.ppe_key_valid =
+-		airoha_soe_parse_ppe_flow_key(skb, &ctx->tx.ppe_key);
+ 	if (sk)
+ 		sock_hold(sk);
+ 
+@@ -2974,82 +2901,25 @@ drop:
+ 	return true;
+ }
+ 
+-static void
+-airoha_soe_complete_untracked_out(struct sk_buff *skb, struct xfrm_state *x)
+-{
+-	struct flowi4 fl4 = {
+-		.flowi4_flags = FLOWI_FLAG_ANYSRC,
+-		.flowi4_scope = RT_SCOPE_UNIVERSE,
+-	};
+-	struct iphdr *iph;
+-	struct rtable *rt;
+-	struct net *net;
+-	int err;
+-
+-	if (!pskb_may_pull(skb, ETH_HLEN + sizeof(*iph)))
+-		goto drop;
+-
+-	skb_pull(skb, ETH_HLEN);
+-	err = airoha_soe_prepare_ip_headers(skb);
+-	if (err || skb->protocol != htons(ETH_P_IP))
+-		goto drop;
+-
+-	iph = ip_hdr(skb);
+-	net = xs_net(x);
+-	fl4.flowi4_mark = xfrm_smark_get(0, x);
+-	fl4.flowi4_dscp = ip4h_dscp(iph);
+-	fl4.saddr = iph->saddr;
+-	fl4.daddr = iph->daddr;
+-	rt = __ip_route_output_key(net, &fl4);
+-	if (IS_ERR(rt))
+-		goto drop;
+-
+-	skb->dev = rt->dst.dev;
+-	skb->mark = fl4.flowi4_mark;
+-	skb->encapsulation = 0;
+-	skb->ip_summed = CHECKSUM_NONE;
+-	skb_unset_mac_header(skb);
+-	skb->mac_len = 0;
+-	skb_dst_drop(skb);
+-	skb_dst_set(skb, &rt->dst);
+-	skb->ignore_df = 1;
+-	memset(IPCB(skb), 0, sizeof(*IPCB(skb)));
+-	IPCB(skb)->flags |= IPSKB_XFRM_TRANSFORMED;
+-	nf_reset_ct(skb);
+-	ip_local_out(net, NULL, skb);
+-
+-	return;
+-
+-drop:
+-	XFRM_INC_STATS(xs_net(x), LINUX_MIB_XFRMOUTERROR);
+-	kfree_skb(skb);
+-}
+-
+ bool airoha_soe_rx_skb(struct airoha_soe *soe, struct sk_buff *skb,
+ 		       unsigned int completion_tag, u32 hop_flags)
+ {
+ 	enum airoha_soe_ctx_dir dir;
+ 	struct airoha_soe_ctx *ctx;
+ 	struct airoha_soe_sa *sa;
+-	struct xfrm_state *x;
+-	unsigned int sa_index;
+ 	u32 success_flag;
+-	bool untracked;
+ 
+-	if (!soe || !skb || completion_tag > U8_MAX)
++	if (!soe || !skb)
+ 		return false;
+-	sa_index = FIELD_GET(AIROHA_SOE_COMPLETION_SA_MASK, completion_tag);
+-	untracked = FIELD_GET(AIROHA_SOE_COMPLETION_SEQ_MASK,
+-			      completion_tag) ==
+-		    AIROHA_SOE_COMPLETION_SEQ_UNTRACKED;
+ 
+ 	rcu_read_lock();
+-	sa = rcu_dereference(soe->sa[sa_index]);
++	sa = completion_tag < AIROHA_SOE_NUM_SA ?
++	     rcu_dereference(soe->sa[completion_tag]) : NULL;
+ 	if (!sa) {
+ 		rcu_read_unlock();
+ 		dev_warn_ratelimited(soe->dev,
+-				     "orphan SOE completion for SA %u, hop flags %#x\n",
+-				     sa_index, hop_flags);
++				     "orphan SOE completion tag %#x, hop flags %#x\n",
++				     completion_tag, hop_flags);
+ 		return false;
+ 	}
+ 
+@@ -3064,33 +2934,13 @@ bool airoha_soe_rx_skb(struct airoha_soe
+ 		kfree_skb(skb);
+ 		return true;
+ 	}
+-	if (untracked) {
+-		if (dir != AIROHA_SOE_CTX_OUT) {
+-			rcu_read_unlock();
+-			kfree_skb(skb);
+-			return true;
+-		}
+-		x = READ_ONCE(sa->x);
+-		if (!x || !xfrm_dev_offload_get(x)) {
+-			rcu_read_unlock();
+-			kfree_skb(skb);
+-			return true;
+-		}
+-		rcu_read_unlock();
+-		airoha_soe_complete_untracked_out(skb, x);
+-		xfrm_dev_offload_put(x);
+-
+-		return true;
+-	}
+ 
+-	ctx = airoha_soe_pop_ctx(sa, dir, completion_tag);
+-	if (!ctx)
+-		airoha_soe_fault_ambiguous_completion(soe, sa, dir);
++	ctx = airoha_soe_pop_ctx(sa, dir);
+ 	rcu_read_unlock();
+ 	if (!ctx) {
+ 		dev_warn_ratelimited(soe->dev,
+-				     "SOE SA %u completion tag %#x has no matching %s context\n",
+-				     sa_index, completion_tag,
++				     "SOE SA %u completion has no queued %s context\n",
++				     completion_tag,
+ 				     dir == AIROHA_SOE_CTX_OUT ? "outbound" :
+ 								    "inbound");
+ 		kfree_skb(skb);
+@@ -3111,31 +2961,23 @@ bool airoha_soe_rx_drop(struct airoha_so
+ 	enum airoha_soe_ctx_dir dir;
+ 	struct airoha_soe_ctx *ctx;
+ 	struct airoha_soe_sa *sa;
+-	unsigned int sa_index;
+ 
+-	if (!soe || completion_tag > U8_MAX)
++	if (!soe || completion_tag >= AIROHA_SOE_NUM_SA)
+ 		return false;
+-	sa_index = FIELD_GET(AIROHA_SOE_COMPLETION_SA_MASK, completion_tag);
+-	if (FIELD_GET(AIROHA_SOE_COMPLETION_SEQ_MASK, completion_tag) ==
+-	    AIROHA_SOE_COMPLETION_SEQ_UNTRACKED)
+-		return true;
+ 
+ 	rcu_read_lock();
+-	sa = rcu_dereference(soe->sa[sa_index]);
++	sa = rcu_dereference(soe->sa[completion_tag]);
+ 	if (!sa) {
+ 		rcu_read_unlock();
+ 		return false;
+ 	}
+ 	dir = sa->cmd & AIROHA_SOE_SA_CMD_ENC ? AIROHA_SOE_CTX_OUT :
+ 						       AIROHA_SOE_CTX_IN;
+-	ctx = airoha_soe_pop_ctx(sa, dir, completion_tag);
+-	if (!ctx) {
+-		airoha_soe_fault_ambiguous_completion(soe, sa, dir);
+-		rcu_read_unlock();
++	ctx = airoha_soe_pop_ctx(sa, dir);
++	rcu_read_unlock();
++	if (!ctx)
+ 		return true;
+-	}
+ 	list_add_tail(&ctx->list, &discarded);
+-	rcu_read_unlock();
+ 	airoha_soe_discard_ctx_list(sa, &discarded);
+ 
+ 	return true;
+--- a/drivers/net/ethernet/airoha/airoha_regs.h
++++ b/drivers/net/ethernet/airoha/airoha_regs.h
+@@ -976,7 +976,6 @@
+ #define QDMA_ETH_RXMSG_AGG_LEN_MASK	GENMASK(31, 16)
+ #define QDMA_ETH_RXMSG_TCP_WIN_MASK	GENMASK(15, 0)
+ /* RX MSG2 */
+-/* SW_UDF carries the SA index and request sequence for SOE completions. */
+ #define QDMA_ETH_RXMSG_SW_UDF_MASK	GENMASK(31, 24)
+ 
+ struct airoha_qdma_desc {

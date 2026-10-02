@@ -1,0 +1,103 @@
+From: hurrhnn <hurrhnn@icmp.kr>
+Date: Fri, 9 Oct 2026 20:00:00 +0900
+Subject: [PATCH] netfilter: flowtable: tear down flows of dead XFRM input states
+
+A flow whose inbound direction an XFRM packet offload state
+authenticated keeps that state, with a reference, in xfrm_input of the
+inbound tuple, and both of its tuples keep the policy generation that
+the packet was checked against. nft_flow_route() gives the tuples of a
+flow with a deferred input state the current generation as well.
+
+Nothing tears such a flow down when its input state is deleted. The
+software path hands every packet of a tuple with XFRM input metadata to
+the slow path before nf_flow_offload_forward(), without looking at the
+state, and the route of that tuple leads to the LAN, so
+nf_flow_dst_check() does not notice a change of the inbound SA. Only an
+outbound SA change makes the xfrm_dst of the other tuple stale. The
+software path does check the policy generation of a tuple it looks up,
+but a flow that the hardware forwards in both directions sends it no
+packet.
+
+Such a flow lives on until it ends, and with it the reference on the
+deleted state. A packet offload driver that releases its resources in
+xdo_dev_state_free() keeps them for as long: the EN7581 SOE releases the
+SA slot of a state, one of 32, there, so a long-lived connection keeps
+the slot of every inbound SA that it outlived reserved. Where the
+hardware forwards the inbound tuple, the driver drops the entry of a
+deleted SA, and the packets that the new SA decrypts reach the CPU until
+the flow ends, because the flow is never created again with the new
+state and its flow id.
+
+Tear a flow down in the GC when one of its tuples carries a policy
+generation other than the current one, or an input state that is no
+longer XFRM_STATE_VALID: deleted, expired or in error. A soft expiry
+(km.dying) does not count, as the state stays in use until IKE replaces
+it. The next packet of the connection creates the flow again with the
+current state and generation. The generation changes with every change
+of the policy database, not with SA changes, so XFRM flows are torn down
+once per policy change, which the software path already does for the
+tuples that it sees. A state dies on rekey, expiry or flush, so a flow
+is torn down once per inbound rekey, mostly within the same second as
+the teardown that the outbound rekey causes through its stale xfrm_dst.
+
+The check runs for every flow on every GC pass and takes no lock. A
+flow without XFRM metadata costs a load and a branch per tuple. The
+flow holds its input state until the GC frees the flow, so the state can
+be read; xfrm_input is read once and km.state, a byte written under
+x->lock, with READ_ONCE().
+
+Signed-off-by: hurrhnn <hurrhnn@icmp.kr>
+---
+diff -urNp a/net/netfilter/nf_flow_table_core.c b/net/netfilter/nf_flow_table_core.c
+--- a/net/netfilter/nf_flow_table_core.c
++++ b/net/netfilter/nf_flow_table_core.c
+@@ -606,6 +606,41 @@ static void nf_flow_table_extend_ct_time
+ 	nf_ct_put(ct);
+ }
+ 
++/* The software path hands the packets of a tuple with XFRM input metadata
++ * to the slow path without looking at its input state, and the route of the
++ * tuple does not lead into the tunnel, so neither a packet nor
++ * nf_flow_dst_check() notices that the state was deleted. A flow that the
++ * hardware forwards in both directions does not notice a policy change
++ * either.
++ */
++static bool nf_flow_xfrm_stale(const struct flow_offload *flow)
++{
++#if IS_ENABLED(CONFIG_XFRM)
++	const struct flow_offload_tuple *tuple;
++	const struct xfrm_state *x;
++	int dir;
++
++	for (dir = 0; dir < FLOW_OFFLOAD_DIR_MAX; dir++) {
++		tuple = &flow->tuplehash[dir].tuple;
++		/* Only a tuple with XFRM input metadata has a generation. */
++		if (!tuple->xfrm_policy_genid)
++			continue;
++
++		if (tuple->xfrm_policy_genid !=
++		    xfrm_policy_generation(nf_ct_net(flow->ct)))
++			return true;
++
++		/* The flow holds a reference on its input state until the GC
++		 * frees the flow, so no lock is needed to look at the state.
++		 */
++		x = READ_ONCE(tuple->xfrm_input);
++		if (x && READ_ONCE(x->km.state) != XFRM_STATE_VALID)
++			return true;
++	}
++#endif
++	return false;
++}
++
+ static void nf_flow_offload_gc_step(struct nf_flowtable *flow_table,
+ 				    struct flow_offload *flow, void *data)
+ {
+@@ -615,6 +650,7 @@ static void nf_flow_offload_gc_step(stru
+ 	    nf_ct_is_dying(flow->ct) ||
+ 	    !nf_flow_dst_check(&flow->tuplehash[FLOW_OFFLOAD_DIR_ORIGINAL].tuple) ||
+ 	    !nf_flow_dst_check(&flow->tuplehash[FLOW_OFFLOAD_DIR_REPLY].tuple) ||
++	    nf_flow_xfrm_stale(flow) ||
+ 	    nf_flow_custom_gc(flow_table, flow)) {
+ 		flow_offload_teardown(flow);
+ 		teardown = true;
