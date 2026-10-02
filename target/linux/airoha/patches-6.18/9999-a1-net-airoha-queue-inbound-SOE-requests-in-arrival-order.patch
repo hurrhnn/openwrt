@@ -1,0 +1,521 @@
+From: hurrhnn <hurrhnn@icmp.kr>
+Date: Sun, 4 Oct 2026 02:00:00 +0900
+Subject: [PATCH] net: airoha: queue inbound SOE requests in arrival order
+
+An SA may have four requests in flight. A burst of inbound ESP fills
+that window at once, and the rest of the burst went to software XFRM.
+Software then delivered those packets ahead of the earlier ones still
+in the engine, which reorders the inner flows, and decrypted them with
+the much slower software AES-GCM.
+
+Keep up to 32 prepared inbound requests per SA on a pending list and
+hand them to the engine in arrival order whenever a slot frees: on a
+completion, an error completion or an expiry, and from a work item when
+an outbound PPE bind ends or the engine restarts after an expired SA.
+The refill therefore runs in the completion NAPI context and not in the
+deferral worker. Only a packet that finds the pending list full falls
+back to software XFRM. The pending requests of an SA that dies are
+dropped.
+
+Signed-off-by: hurrhnn <hurrhnn@icmp.kr>
+---
+--- a/drivers/net/ethernet/airoha/airoha_soe.c
++++ b/drivers/net/ethernet/airoha/airoha_soe.c
+@@ -175,6 +175,8 @@
+ #define AIROHA_SOE_HOP_INFO_ENCRYPT 2
+ #define AIROHA_SOE_HOP_INFO_DECRYPT 3
+ #define AIROHA_SOE_SA_INFLIGHT_MAX 4
++/* Inbound requests waiting for an in-flight slot, per SA. */
++#define AIROHA_SOE_RX_PENDING_MAX 32
+ #define AIROHA_SOE_CTX_TIMEOUT HZ
+ #define AIROHA_SOE_CTX_EXPIRE_INTERVAL (AIROHA_SOE_CTX_TIMEOUT / 2)
+ #define AIROHA_SOE_SA_COOLDOWN (2 * AIROHA_SOE_CTX_TIMEOUT)
+@@ -218,6 +220,8 @@ struct airoha_soe_ctx {
+ 			__be32 saddr;
+ 			__be16 sport;
+ 			__be32 seq;
++			struct airoha_gdm_dev *gdm;
++			struct sk_buff *pending_skb;
+ 			u16 foe_hash;
+ 			bool foe_valid;
+ 		} rx;
+@@ -241,9 +245,12 @@ struct airoha_soe_sa {
+ 	spinlock_t lock; /* Protects in-flight context queues and dead. */
+ 	struct list_head tx_queue;
+ 	struct list_head rx_queue;
++	/* Prepared inbound requests not yet handed to the engine, in order. */
++	struct list_head rx_pending;
+ 	struct list_head ppe_flows;
+ 	struct completion idle;
+ 	unsigned int inflight;
++	unsigned int rx_pending_len;
+ 	struct airoha_soe_ppe_key ppe_key;
+ 	bool hw_cleared;
+ 	bool quarantined;
+@@ -302,6 +309,7 @@ struct airoha_soe {
+ 	struct work_struct seq_work;
+ 	struct work_struct policy_work;
+ 	struct work_struct bind_tx_work;
++	struct work_struct rx_kick_work;
+ 	struct delayed_work expire_work;
+ 	struct list_head ppe_flows;
+ 	struct list_head bind_tx_queue;
+@@ -318,6 +326,7 @@ struct airoha_soe {
+ 	atomic_t seq_pending;
+ 	atomic_t queued_ctx;
+ 	atomic_t active_ctx;
++	atomic_t rx_pending;
+ 
+ 	spinlock_t state_lock; /* Protects dead against concurrent users. */
+ 	/* Protects CPU submission, PPE binding and sequence quiesce/restart. */
+@@ -348,6 +357,13 @@ static unsigned int airoha_soe_list_user
+ 
+ static const struct xfrmdev_ops airoha_soe_xfrmdev_ops;
+ static const struct xfrmdev_ops airoha_soe_dsa_xfrmdev_ops;
++static void airoha_soe_free_ctx(struct airoha_soe_ctx *ctx);
++static void airoha_soe_rx_drain_locked(struct airoha_soe_sa *sa,
++				       struct list_head *failed,
++				       unsigned int *active_sub);
++static void airoha_soe_rx_drain_done(struct airoha_soe *soe,
++				     struct list_head *failed,
++				     unsigned int active_sub);
+ static void airoha_soe_detach_queued_ctx(struct airoha_soe_sa *sa,
+ 					 struct list_head *tx_queue,
+ 					 struct list_head *rx_queue);
+@@ -443,16 +459,40 @@ u32 airoha_soe_features(struct airoha_so
+ 	return airoha_soe_available(soe) ? AIROHA_SOE_FEATURE_ESP : 0;
+ }
+ 
++static void airoha_soe_purge_rx_pending(struct airoha_soe *soe,
++					struct list_head *head,
++					unsigned int count)
++{
++	struct airoha_soe_ctx *ctx, *tmp;
++
++	if (count)
++		atomic_sub(count, &soe->rx_pending);
++	list_for_each_entry_safe(ctx, tmp, head, list) {
++		list_del(&ctx->list);
++		kfree_skb(ctx->rx.pending_skb);
++		ctx->rx.pending_skb = NULL;
++		airoha_soe_free_ctx(ctx);
++	}
++}
++
+ static void airoha_soe_mark_sa_dead(struct airoha_soe_sa *sa)
+ {
++	LIST_HEAD(rx_pending);
++	unsigned int npending;
++
+ 	if (!sa)
+ 		return;
+ 
+ 	spin_lock_bh(&sa->lock);
+ 	sa->dead = true;
++	/* Queued inbound requests never reached the engine; drop them. */
++	npending = sa->rx_pending_len;
++	sa->rx_pending_len = 0;
++	list_splice_init(&sa->rx_pending, &rx_pending);
+ 	if (!sa->inflight)
+ 		complete(&sa->idle);
+ 	spin_unlock_bh(&sa->lock);
++	airoha_soe_purge_rx_pending(sa->soe, &rx_pending, npending);
+ 	airoha_soe_purge_bind_tx(sa->soe, sa);
+ }
+ 
+@@ -633,6 +673,11 @@ static bool airoha_soe_ppe_bind_end_lock
+ 	soe->ppe_bind_active = false;
+ 	flush_tx = !list_empty(&soe->bind_tx_queue);
+ 	soe->bind_tx_draining = flush_tx;
++	/* Inbound requests queued during the bind have no completion left to
++	 * wake them. queue_work() is safe under the seq_lock.
++	 */
++	if (atomic_read(&soe->rx_pending))
++		schedule_work(&soe->rx_kick_work);
+ 
+ 	return flush_tx;
+ }
+@@ -1090,6 +1135,8 @@ static void airoha_soe_seq_work(struct w
+ 			airoha_soe_ppe_adopt_quiesce(soe, quiesced);
+ 		else if (quiesced)
+ 			airoha_ppe_soe_resume(soe->eth);
++		if (atomic_read(&soe->rx_pending))
++			schedule_work(&soe->rx_kick_work);
+ 		return;
+ 	}
+ }
+@@ -1905,6 +1952,7 @@ static int airoha_soe_alloc_sa(struct ai
+ 	spin_lock_init(&new_sa->lock);
+ 	INIT_LIST_HEAD(&new_sa->tx_queue);
+ 	INIT_LIST_HEAD(&new_sa->rx_queue);
++	INIT_LIST_HEAD(&new_sa->rx_pending);
+ 	INIT_LIST_HEAD(&new_sa->ppe_flows);
+ 	init_completion(&new_sa->idle);
+ 	err = airoha_soe_ppe_mark_conflicts_locked(soe, new_sa);
+@@ -2125,6 +2173,7 @@ static void airoha_soe_free_sa(struct ai
+ 	spin_lock_bh(&sa->lock);
+ 	WARN_ON_ONCE(sa->inflight);
+ 	WARN_ON_ONCE(!list_empty(&sa->ppe_flows));
++	WARN_ON_ONCE(!list_empty(&sa->rx_pending));
+ 	queued = list_count_nodes(&sa->tx_queue) +
+ 		 list_count_nodes(&sa->rx_queue);
+ 	list_splice_init(&sa->tx_queue, &tx_queue);
+@@ -2177,6 +2226,9 @@ static void airoha_soe_discard_ctx_list(
+ 					struct list_head *head)
+ {
+ 	unsigned int count = list_count_nodes(head);
++	struct airoha_soe *soe = sa->soe;
++	unsigned int active_sub = 0;
++	LIST_HEAD(failed);
+ 
+ 	if (!count)
+ 		return;
+@@ -2187,25 +2239,32 @@ static void airoha_soe_discard_ctx_list(
+ 	sa->inflight -= count;
+ 	if (sa->dead && !sa->inflight)
+ 		complete(&sa->idle);
++	else if (!sa->dead)
++		airoha_soe_rx_drain_locked(sa, &failed, &active_sub);
+ 	spin_unlock_bh(&sa->lock);
+-	airoha_soe_active_ctx_sub(sa->soe, count);
++	airoha_soe_active_ctx_sub(soe, count);
+ 	airoha_soe_purge_ctx_list(head);
++	airoha_soe_rx_drain_done(soe, &failed, active_sub);
+ }
+ 
+ static void airoha_soe_finish_ctx(struct airoha_soe_sa *sa)
+ {
+-	bool finished = false;
++	struct airoha_soe *soe = sa->soe;
++	unsigned int active_sub = 0;
++	LIST_HEAD(failed);
+ 
+ 	spin_lock_bh(&sa->lock);
+ 	if (!WARN_ON_ONCE(!sa->inflight)) {
+ 		sa->inflight--;
+-		finished = true;
++		active_sub++;
+ 		if (sa->dead && !sa->inflight)
+ 			complete(&sa->idle);
++		else if (!sa->dead)
++			/* Refill the slot this completion freed, in order. */
++			airoha_soe_rx_drain_locked(sa, &failed, &active_sub);
+ 	}
+ 	spin_unlock_bh(&sa->lock);
+-	if (finished)
+-		airoha_soe_active_ctx_sub(sa->soe, 1);
++	airoha_soe_rx_drain_done(soe, &failed, active_sub);
+ }
+ 
+ static void airoha_soe_expire_ctx(struct airoha_soe_sa *sa,
+@@ -2250,6 +2309,8 @@ static void airoha_soe_expire_work(struc
+ 	if (atomic_read(&soe->queued_ctx))
+ 		schedule_delayed_work(&soe->expire_work,
+ 				      AIROHA_SOE_CTX_EXPIRE_INTERVAL);
++	if (atomic_read(&soe->rx_pending))
++		schedule_work(&soe->rx_kick_work);
+ }
+ 
+ static int airoha_soe_prepare_ip_headers(struct sk_buff *skb)
+@@ -2466,11 +2527,8 @@ airoha_soe_submit_prepared_skb(struct ai
+ 	return err;
+ }
+ 
+-static int airoha_soe_submit_skb(struct airoha_soe_sa *sa,
+-				 struct airoha_gdm_dev *dev,
+-				 struct sk_buff *skb,
+-				 struct airoha_soe_ctx *ctx,
+-				 struct xfrm_state *x)
++static int airoha_soe_prepare_skb(struct sk_buff *skb,
++				  struct airoha_soe_ctx *ctx)
+ {
+ 	unsigned int headroom = AIROHA_SOE_QDMA_HOP_DESC_LEN + ETH_HLEN;
+ 	int err;
+@@ -2504,13 +2562,216 @@ static int airoha_soe_submit_skb(struct
+ 	if (err)
+ 		return err;
+ 
+-	err = airoha_soe_push_l2_header(skb);
++	return airoha_soe_push_l2_header(skb);
++}
++
++static int airoha_soe_submit_skb(struct airoha_soe_sa *sa,
++				 struct airoha_gdm_dev *dev,
++				 struct sk_buff *skb,
++				 struct airoha_soe_ctx *ctx,
++				 struct xfrm_state *x)
++{
++	int err;
++
++	err = airoha_soe_prepare_skb(skb, ctx);
+ 	if (err)
+ 		return err;
+ 
+ 	return airoha_soe_submit_prepared_skb(sa, dev, skb, ctx, x, false);
+ }
+ 
++/* Hand one queued inbound request to the engine. Called with sa->lock held.
++ * -EAGAIN keeps the request queued. On any other error the request is not
++ * in flight and the caller frees it.
++ */
++static int airoha_soe_rx_submit_locked(struct airoha_soe_sa *sa,
++				       struct airoha_soe_ctx *ctx,
++				       unsigned int *active_sub)
++{
++	struct airoha_gdm_dev *dev = ctx->rx.gdm;
++	struct sk_buff *skb = ctx->rx.pending_skb;
++	struct airoha_soe *soe = sa->soe;
++	unsigned long flags;
++	u32 msg0, msg1;
++	int err;
++
++	lockdep_assert_held(&sa->lock);
++
++	if (!dev || !skb || !dev->soe_xmit_skb)
++		return -ENODEV;
++
++	msg0 = FIELD_PREP(QDMA_ETH_TXMSG_SOE_SA_MASK, sa->index & 0x3f);
++	msg1 = FIELD_PREP(QDMA_ETH_TXMSG_METER_MASK, 0x7f) |
++	       FIELD_PREP(QDMA_ETH_TXMSG_FPORT_MASK, 7) |
++	       FIELD_PREP(QDMA_ETH_TXMSG_NBOQ_MASK,
++			  AIROHA_SOE_QDMA_QUEUE_DECRYPT) |
++	       QDMA_ETH_TXMSG_HOP_MASK |
++	       FIELD_PREP(QDMA_ETH_TXMSG_ACNT_G1_MASK, 0x1f) |
++	       FIELD_PREP(QDMA_ETH_TXMSG_ACNT_G0_MASK, 0x3f);
++
++	spin_lock_irqsave(&soe->seq_lock, flags);
++	/* An outbound PPE bind waits for every CPU request to drain, and a
++	 * stopped engine must not see new work. Both end with a kick.
++	 */
++	if (soe->seq_stopped || soe->ppe_bind_active) {
++		spin_unlock_irqrestore(&soe->seq_lock, flags);
++		return -EAGAIN;
++	}
++	if (sa->dead || !airoha_soe_available(soe)) {
++		spin_unlock_irqrestore(&soe->seq_lock, flags);
++		return -ENOENT;
++	}
++	if (sa->inflight >= AIROHA_SOE_SA_INFLIGHT_MAX) {
++		spin_unlock_irqrestore(&soe->seq_lock, flags);
++		return -EAGAIN;
++	}
++
++	skb->dev = netdev_from_priv(dev);
++	skb_set_queue_mapping(skb, AIROHA_SOE_QDMA_TX_RING);
++	airoha_soe_push_hop_desc(skb, sa->index, false);
++	ctx->submitted = jiffies;
++	list_add_tail(&ctx->list, &sa->rx_queue);
++	sa->inflight++;
++	if (atomic_inc_return(&soe->queued_ctx) == 1)
++		schedule_delayed_work(&soe->expire_work,
++				      AIROHA_SOE_CTX_EXPIRE_INTERVAL);
++	atomic_inc(&soe->active_ctx);
++	reinit_completion(&sa->idle);
++	spin_unlock_irqrestore(&soe->seq_lock, flags);
++
++	err = dev->soe_xmit_skb(dev, skb, msg0, msg1,
++				AIROHA_SOE_TXMSG2_DEFAULT);
++	if (err) {
++		list_del_init(&ctx->list);
++		atomic_dec(&soe->queued_ctx);
++		sa->inflight--;
++		(*active_sub)++;
++		return err;
++	}
++
++	/* The TX ring owns the skb now. */
++	ctx->rx.pending_skb = NULL;
++
++	return 0;
++}
++
++/* Submit queued inbound requests in arrival order while slots are free.
++ * Called with sa->lock held; the caller passes @failed and @active_sub to
++ * airoha_soe_rx_drain_done() after dropping the lock.
++ */
++static void airoha_soe_rx_drain_locked(struct airoha_soe_sa *sa,
++				       struct list_head *failed,
++				       unsigned int *active_sub)
++{
++	lockdep_assert_held(&sa->lock);
++
++	while (!list_empty(&sa->rx_pending)) {
++		struct airoha_soe_ctx *ctx;
++		int err;
++
++		ctx = list_first_entry(&sa->rx_pending, struct airoha_soe_ctx,
++				       list);
++		list_del_init(&ctx->list);
++		err = airoha_soe_rx_submit_locked(sa, ctx, active_sub);
++		if (err == -EAGAIN) {
++			list_add(&ctx->list, &sa->rx_pending);
++			break;
++		}
++		sa->rx_pending_len--;
++		atomic_dec(&sa->soe->rx_pending);
++		if (err)
++			list_add_tail(&ctx->list, failed);
++	}
++}
++
++static void airoha_soe_rx_drain_done(struct airoha_soe *soe,
++				     struct list_head *failed,
++				     unsigned int active_sub)
++{
++	struct airoha_soe_ctx *ctx, *tmp;
++
++	if (active_sub)
++		airoha_soe_active_ctx_sub(soe, active_sub);
++
++	list_for_each_entry_safe(ctx, tmp, failed, list) {
++		list_del(&ctx->list);
++		if (ctx->rx.x)
++			XFRM_INC_STATS(xs_net(ctx->rx.x), LINUX_MIB_XFRMINERROR);
++		kfree_skb(ctx->rx.pending_skb);
++		ctx->rx.pending_skb = NULL;
++		airoha_soe_free_ctx(ctx);
++	}
++}
++
++/* Queue a prepared inbound request behind earlier ones and submit what the
++ * in-flight window allows. On error the caller still owns @skb and @ctx.
++ */
++static int airoha_soe_rx_queue_skb(struct airoha_soe_sa *sa,
++				   struct airoha_gdm_dev *dev,
++				   struct sk_buff *skb,
++				   struct airoha_soe_ctx *ctx)
++{
++	struct airoha_soe *soe = sa->soe;
++	unsigned int active_sub = 0;
++	LIST_HEAD(failed);
++	int err;
++
++	err = airoha_soe_prepare_skb(skb, ctx);
++	if (err)
++		return err;
++
++	/* Reclaim lost requests first, as the direct submit path does. */
++	airoha_soe_expire_ctx(sa, &sa->rx_queue);
++
++	spin_lock_bh(&sa->lock);
++	if (sa->dead || !airoha_soe_available(soe)) {
++		err = -ENOENT;
++	} else if (sa->rx_pending_len >= AIROHA_SOE_RX_PENDING_MAX) {
++		err = -ENOSPC;
++	} else {
++		ctx->rx.gdm = dev;
++		ctx->rx.pending_skb = skb;
++		list_add_tail(&ctx->list, &sa->rx_pending);
++		sa->rx_pending_len++;
++		atomic_inc(&soe->rx_pending);
++		airoha_soe_rx_drain_locked(sa, &failed, &active_sub);
++	}
++	spin_unlock_bh(&sa->lock);
++	airoha_soe_rx_drain_done(soe, &failed, active_sub);
++
++	return err;
++}
++
++/* Resubmit queued inbound requests after an outbound PPE bind or an engine
++ * stop ended. Nothing else would wake them when no request is in flight.
++ */
++static void airoha_soe_rx_kick_work(struct work_struct *work)
++{
++	struct airoha_soe *soe =
++		container_of(work, struct airoha_soe, rx_kick_work);
++	unsigned int i;
++
++	if (!atomic_read(&soe->rx_pending))
++		return;
++
++	rcu_read_lock();
++	for (i = 0; i < AIROHA_SOE_NUM_SA; i++) {
++		struct airoha_soe_sa *sa = rcu_dereference(soe->sa[i]);
++		unsigned int active_sub = 0;
++		LIST_HEAD(failed);
++
++		if (!sa || (sa->cmd & AIROHA_SOE_SA_CMD_ENC))
++			continue;
++
++		spin_lock_bh(&sa->lock);
++		if (!sa->dead)
++			airoha_soe_rx_drain_locked(sa, &failed, &active_sub);
++		spin_unlock_bh(&sa->lock);
++		airoha_soe_rx_drain_done(soe, &failed, active_sub);
++	}
++	rcu_read_unlock();
++}
++
+ static void airoha_soe_bind_tx_work(struct work_struct *work)
+ {
+ 	struct airoha_soe *soe =
+@@ -2815,15 +3076,16 @@ bool airoha_soe_rx_plain_skb(struct airo
+ 			goto put_state;
+ 		if (flow_tag)
+ 			goto sw_tag;
+-	} else if (airoha_soe_ppe_bind_is_active(soe) ||
+-		   READ_ONCE(soe->seq_stopped)) {
+-		/* An outbound PPE bind is draining CPU requests, or the engine
+-		 * is stopped for an expiring SA. Do not hold this packet back.
++	} else if (READ_ONCE(sa->rx_pending_len) >=
++		   AIROHA_SOE_RX_PENDING_MAX) {
++		/* The queue in front of the engine is full. Decrypt this one
++		 * in software rather than drop it.
+ 		 */
+ 		goto sw_tag;
+ 	}
+ 
+-	if (READ_ONCE(sa->inflight) >= AIROHA_SOE_SA_INFLIGHT_MAX)
++	if (!soe_default &&
++	    READ_ONCE(sa->inflight) >= AIROHA_SOE_SA_INFLIGHT_MAX)
+ 		goto sw_tag;
+ 
+ 	ctx = kzalloc_obj(*ctx, GFP_ATOMIC);
+@@ -2850,7 +3112,14 @@ bool airoha_soe_rx_plain_skb(struct airo
+ 	if (skb->len != info.packet_len && pskb_trim(skb, info.packet_len))
+ 		goto drop_ctx;
+ 
+-	err = airoha_soe_submit_skb(sa, dev, skb, ctx, x);
++	/* The default path queues behind earlier requests of the SA so that
++	 * a full in-flight window never reorders packets between the engine
++	 * and software XFRM. Completions refill the window in order.
++	 */
++	if (soe_default)
++		err = airoha_soe_rx_queue_skb(sa, dev, skb, ctx);
++	else
++		err = airoha_soe_submit_skb(sa, dev, skb, ctx, x);
+ 	if (err)
+ 		goto drop_ctx;
+ 
+@@ -3929,6 +4198,7 @@ int airoha_soe_init(struct airoha_eth *e
+ 	atomic_set(&soe->seq_pending, 0);
+ 	atomic_set(&soe->queued_ctx, 0);
+ 	atomic_set(&soe->active_ctx, 0);
++	atomic_set(&soe->rx_pending, 0);
+ 	refcount_set(&soe->refcnt, 1);
+ 	init_completion(&soe->released);
+ 	INIT_WORK(&soe->fault_work, airoha_soe_fault_work);
+@@ -3936,6 +4206,7 @@ int airoha_soe_init(struct airoha_eth *e
+ 	INIT_WORK(&soe->seq_work, airoha_soe_seq_work);
+ 	INIT_WORK(&soe->policy_work, airoha_soe_policy_work);
+ 	INIT_WORK(&soe->bind_tx_work, airoha_soe_bind_tx_work);
++	INIT_WORK(&soe->rx_kick_work, airoha_soe_rx_kick_work);
+ 	INIT_DELAYED_WORK(&soe->expire_work, airoha_soe_expire_work);
+ 	soe->netdev_nb.notifier_call = airoha_soe_netdev_event;
+ 
+@@ -4023,6 +4294,7 @@ void airoha_soe_deinit(struct airoha_eth
+ 	soe->dead = true;
+ 	spin_unlock_irqrestore(&soe->state_lock, flags);
+ 	cancel_work_sync(&soe->bind_tx_work);
++	cancel_work_sync(&soe->rx_kick_work);
+ 	airoha_soe_purge_bind_tx(soe, NULL);
+ 	if (soe->started)
+ 		airoha_soe_policy_unregister(soe);
+@@ -4039,6 +4311,7 @@ void airoha_soe_deinit(struct airoha_eth
+ 	cancel_delayed_work_sync(&soe->expire_work);
+ 	/* State teardown can fault and reschedule this work while refs drain. */
+ 	cancel_work_sync(&soe->bind_tx_work);
++	cancel_work_sync(&soe->rx_kick_work);
+ 	airoha_soe_purge_bind_tx(soe, NULL);
+ 	cancel_work_sync(&soe->error_work);
+ 	airoha_soe_cancel_seq_work(soe);

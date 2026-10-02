@@ -1,0 +1,90 @@
+From: hurrhnn <hurrhnn@icmp.kr>
+Date: Sun, 4 Oct 2026 03:10:00 +0900
+Subject: [PATCH] xfrm: drop the inner priority when the outer DSCP is not copied
+
+ip_forward() sets skb->priority from the TOS of a forwarded IPv4
+packet, unless net.ipv4.ip_forward_update_priority is cleared, and a
+tunnel mode SA leaves that priority on the packet it builds. A priority
+can also arrive with the inner packet, for example from the ingress QoS
+map of a VLAN device. Qdiscs and drivers that schedule by priority then
+put the inner classes of one SA into different flows or queues.
+fq_codel uses the minor number of a priority whose major number equals
+its handle as the flow index instead of the flow hash. The default
+qdiscs that mq attaches to the tx queues have handle 0, so every
+non-zero priority from rt_tos2priority() selects a fixed flow of its
+own. mqprio and some multiqueue drivers map the priority to a tx queue.
+The SA numbers its packets before they are queued, and the peer drops
+a packet that falls behind its replay window.
+
+On EN7581 with a software ESP SA that does not copy the DSCP, all ESP
+packets in one tx queue and one flow hash for the SA, a ping flood with
+DSCP AF21, which rt_tos2priority() maps to priority 2, next to an
+upload through the tunnel raised XfrmInStateSeqError of the peer by
+255 in 10 s. With a POSTROUTING rule that set the priority of the ESP
+packets to 0, it rose by 1.
+
+A tunnel mode SA with XFRM_SA_XFLAG_DONT_ENCAP_DSCP does not copy the
+inner DSCP to the outer header, so the outer packet carries no class of
+the inner packet on the wire. Drop the priority of the inner packet as
+well, for software states once the outer header has been added, and for
+packet offload states before the packet is handed to the driver or sent
+to the device. This also keeps the inner class out of the PCP that a
+VLAN egress QoS map derives from the priority. Each tunnel state of a
+nested bundle that has the flag drops it.
+
+Only priorities with major number 0 are dropped: the values from
+rt_tos2priority(), from an unprivileged SO_PRIORITY and from a VLAN
+ingress QoS map, and any other such value set on the inner packet. A
+priority with a major number is a qdisc class id, set explicitly by a
+tc skbedit action, a netfilter rule or a privileged SO_PRIORITY, and is
+kept. A priority set on the outer packet, in the OUTPUT or POSTROUTING
+hook or by a tc filter on the egress device, still applies.
+
+SAs that copy the DSCP keep the inner priority, and so do transport and
+BEET mode SAs, which leave the DSCP of the packet on the wire. RFC 4301
+section 4.1 expects a sender to put traffic classes that are scheduled
+apart on separate SAs.
+
+Signed-off-by: hurrhnn <hurrhnn@icmp.kr>
+---
+--- a/net/xfrm/xfrm_output.c
++++ b/net/xfrm/xfrm_output.c
+@@ -560,6 +560,22 @@ static void xfrm_set_flow_hash(struct sk
+ 	__skb_set_sw_hash(skb, flow_hash_from_keys(&keys), true);
+ }
+ 
++/* A tunnel mode SA with XFRM_SA_XFLAG_DONT_ENCAP_DSCP keeps the class of
++ * the inner packet off the outer header. Drop the priority that came
++ * with the inner packet as well: qdiscs and drivers that schedule by
++ * skb->priority would otherwise split the SA by inner class and reorder
++ * its packets across the peer's replay window. A priority with a major
++ * number is a qdisc class id that was set explicitly, and is kept.
++ */
++static void xfrm_set_outer_priority(struct sk_buff *skb,
++				    const struct xfrm_state *x)
++{
++	if (x->props.mode == XFRM_MODE_TUNNEL &&
++	    (x->props.extra_flags & XFRM_SA_XFLAG_DONT_ENCAP_DSCP) &&
++	    !TC_H_MAJ(skb->priority))
++		skb->priority = 0;
++}
++
+ static int xfrm_output_one(struct sk_buff *skb, int err)
+ {
+ 	struct dst_entry *dst = skb_dst(skb);
+@@ -593,6 +609,7 @@ static int xfrm_output_one(struct sk_buf
+ 		}
+ 
+ 		xfrm_set_flow_hash(skb, x);
++		xfrm_set_outer_priority(skb, x);
+ 
+ 		err = xfrm_dev_packet_state_check(x, skb);
+ 		if (err)
+@@ -846,6 +863,7 @@ int xfrm_output(struct sock *sk, struct
+ 			goto state_invalid;
+ 		}
+ 
++		xfrm_set_outer_priority(skb, x);
+ 		if (ops->xdo_dev_packet_xmit) {
+ 			skb->mark = xfrm_smark_get(skb->mark, x);
+ 			err = ops->xdo_dev_packet_xmit(sk, skb, x);

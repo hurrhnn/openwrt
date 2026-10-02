@@ -1,0 +1,122 @@
+From: hurrhnn <hurrhnn@icmp.kr>
+Date: Sun, 4 Oct 2026 02:20:00 +0900
+Subject: [PATCH] net: airoha: keep IPsec packets in one QoS queue
+
+airoha_dev_select_queue() picks the QoS queue of a packet from its skb
+priority. A tunnel mode IPsec packet carries the priority of its inner
+packet: ip_forward() sets it from the TOS of a forwarded IPv4 packet,
+and the SOE CPU path copies it from the submitted packet to the
+encrypted result before that re-enters LOCAL_OUT. The inner flows of
+one SA can therefore be spread over several QoS queues. Every QoS queue
+is a tx queue and a QDMA ring of its own and the queues are scheduled
+apart, while the SA has numbered its packets before they were queued,
+and the peer drops every packet that falls behind its replay window.
+With a ping flood marked DSCP AF21 running next to an upload through a
+software ESP tunnel, the XfrmInStateSeqError counter of the peer rose
+by 689 in 10 s. The same flood sent with DSCP 0 did not raise it.
+
+Send ESP packets and ESP in UDP packets (RFC 3948, port 4500) to the
+first queue of their channel regardless of the skb priority. Packets
+whose priority already selects the first queue are not parsed.
+
+Port 4500 also matches IKE and NAT keepalive packets, which move to the
+first queue as well. IPv4 fragments of UDP packets keep the priority
+queue, since only the first one carries the UDP header and the
+fragments of a datagram should stay together. IPv6 extension headers,
+PPPoE, IP in IPv6 tunnels and VLAN tags that are inserted in software
+before the packet reaches this device, as on a VLAN device on top of a
+DSA user port, are not parsed either, and those packets keep the
+priority queue.
+
+All IPsec packets of a channel now share its first queue, and an skb
+priority set on the ESP packets themselves, such as by tc skbedit or an
+nft meta priority rule, no longer selects their queue. RFC 4301
+section 4.1 already expects traffic classes that are scheduled apart
+to use separate SAs.
+
+Signed-off-by: hurrhnn <hurrhnn@icmp.kr>
+---
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -3288,6 +3288,64 @@ static int airoha_dev_change_mtu(struct
+ 	return 0;
+ }
+ 
++/* An IPsec SA numbers its packets before they are queued, and the peer
++ * drops a packet that falls behind its replay window. The skb priority
++ * of a tunnel packet comes from the inner packet, so the inner flows of
++ * one SA can carry different priorities. ESP in UDP is recognised by
++ * port 4500, which IKE and NAT keepalives share. Fragments of UDP
++ * packets are not parsed, so all fragments of a datagram stay together.
++ */
++static bool airoha_skb_is_ipsec(const struct sk_buff *skb)
++{
++	int offset = skb_network_offset(skb);
++	const struct udphdr *udph;
++	struct udphdr _udph;
++	u8 proto;
++
++	switch (skb->protocol) {
++	case htons(ETH_P_IP): {
++		const struct iphdr *iph;
++		struct iphdr _iph;
++
++		iph = skb_header_pointer(skb, offset, sizeof(_iph), &_iph);
++		if (!iph || iph->ihl < 5)
++			return false;
++
++		proto = iph->protocol;
++		if (proto == IPPROTO_UDP && ip_is_fragment(iph))
++			return false;
++
++		offset += iph->ihl * 4;
++		break;
++	}
++	case htons(ETH_P_IPV6): {
++		const struct ipv6hdr *ip6h;
++		struct ipv6hdr _ip6h;
++
++		ip6h = skb_header_pointer(skb, offset, sizeof(_ip6h), &_ip6h);
++		if (!ip6h)
++			return false;
++
++		proto = ip6h->nexthdr;
++		offset += sizeof(*ip6h);
++		break;
++	}
++	default:
++		return false;
++	}
++
++	if (proto == IPPROTO_ESP)
++		return true;
++	if (proto != IPPROTO_UDP)
++		return false;
++
++	/* ESP in UDP, RFC 3948 */
++	udph = skb_header_pointer(skb, offset, sizeof(_udph), &_udph);
++
++	return udph && (udph->dest == htons(4500) ||
++			udph->source == htons(4500));
++}
++
+ static u16 airoha_dev_select_queue(struct net_device *netdev,
+ 				   struct sk_buff *skb,
+ 				   struct net_device *sb_dev)
+@@ -3298,11 +3356,15 @@ static u16 airoha_dev_select_queue(struc
+ 
+ 	/* For dsa device select QoS channel according to the dsa user port
+ 	 * index, rely on port id otherwise. Select QoS queue based on the
+-	 * skb priority.
++	 * skb priority, except for IPsec packets: the QoS queues are
++	 * scheduled apart and would reorder the packets of an SA, so keep
++	 * them in the first queue of the channel.
+ 	 */
+ 	channel = netdev_uses_dsa(netdev) ? skb_get_queue_mapping(skb) : port->id;
+ 	channel = channel % AIROHA_NUM_QOS_CHANNELS;
+ 	queue = skb->priority % AIROHA_NUM_QOS_QUEUES;
++	if (queue && airoha_skb_is_ipsec(skb))
++		queue = 0;
+ 	queue = channel * AIROHA_NUM_QOS_QUEUES + queue;
+ 
+ 	return queue < netdev->num_tx_queues ? queue : 0;

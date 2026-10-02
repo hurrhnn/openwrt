@@ -1,0 +1,184 @@
+From: hurrhnn <hurrhnn@icmp.kr>
+Date: Sun, 4 Oct 2026 03:00:00 +0900
+Subject: [PATCH] xfrm: fragment oversized IPv4 packets before packet offload
+
+A packet offload state hands the inner packet to the driver, and the
+device adds the outer header and the ESP trailer. Before that,
+xfrm_output() checks the inner packet with xfrm_dev_offload_ok(), which
+refuses a packet that is longer than the inner MTU of the SA, the
+xfrm_state_mtu() of the cached child MTU, and xfrm_output() frees it.
+Only LINUX_MIB_XFRMOUTERROR counts the drop, and only with
+XFRM_STATISTICS. No ICMP error is sent. A software ESP state encrypts
+the same packet as a whole, and ip_output() fragments the outer packet
+when DF is clear. With packet offload the device builds the outer
+packet and may transmit it itself, so the stack cannot fragment it
+afterwards.
+
+On EN7581 with SOE packet offload, a LAN host sent 1500 byte UDP
+datagrams through an IPv4 ESP tunnel as two fragments, because its path
+MTU was lower. Conntrack reassembled them for forwarding, and every
+reassembled datagram that was longer than the inner MTU of the SA was
+freed silently. With a software SA the same datagrams reached the peer.
+xfrm_output() also clears the IPv4 control block, so the size of the
+original fragments is lost by the time the packet is refused.
+
+RFC 4301 lets a security gateway fragment IPv4 packets before it
+applies a tunnel mode SA (section 5.1). A packet that exceeds the PMTU
+of an SA is to be fragmented when DF is clear and discarded with an
+ICMP PMTU message when DF is set (section 8.2.1). Do this in
+__xfrm4_output(), after the POSTROUTING hook and before xfrm_output(),
+for a packet that is not GSO, has no IP options and is longer than the
+MTU that xfrm_dev_offload_ok() checks, when the first state of the
+bundle is a tunnel mode packet offload state without a nested
+transform, bound to the device of the path, whose driver transmits
+through xdo_dev_packet_xmit():
+
+- A packet that must not be fragmented, by the rule of ip_fragment(),
+  is dropped with -EMSGSIZE. A full socket gets the error through
+  xfrm_local_error(), and any other sender ICMP FRAG_NEEDED carrying
+  that MTU, as in xfrm4_tunnel_check_size(). ip_forward() already
+  rejects most such forwarded packets against the MTU of the bundle.
+- Any other packet gets frag_max_size lowered to that MTU and is
+  fragmented with ip_do_fragment(). Each fragment is passed to
+  xfrm_output() directly, so the hook does not run again, and fits the
+  MTU that xfrm_dev_offload_ok() checks. A reassembled packet keeps the
+  size of its original fragments if they were smaller.
+
+A packet with IP options or for a state bound to another device is
+refused by xfrm_dev_offload_ok() at any length, so it is left to that
+check and does not get an MTU error it cannot act on.
+
+Only a driver that transmits through xdo_dev_packet_xmit() encrypts
+every packet it is given with the state that the stack selected.
+Without that callback, xfrm_output() sends the plaintext packet to the
+device, which matches it against its own policy and state rules. mlx5
+installs its TX policy and SA rules for non-fragmented packets only, so
+it would send the fragments unencrypted. Oversized packets for the
+packet offload states of such drivers are still dropped.
+
+The fragments are sent on the SA that was selected for the whole
+packet. They are not looked up in the SPD again, although section 5.1
+evaluates fragments made before IPsec against the SPD, and there is no
+setting to turn this fragmentation off. A peer that checks non-initial
+fragments against its inbound policy before reassembly accepts them
+only on an SA whose port selectors are ANY, as described in RFC 4301
+section 7.
+
+Software and crypto offload states, transport, BEET and IPTFS mode
+states, GSO packets and packets that fit are not changed. The offload
+state is read under an offload reference, as xfrm_output() does, and
+only for packets above the MTU.
+
+IPv6 is not changed. __xfrm6_output() already fragments tunnel mode
+packets that exceed the MTU of the bundle with ip6_fragment() before
+xfrm_output(), for every state type.
+
+Signed-off-by: hurrhnn <hurrhnn@icmp.kr>
+---
+--- a/net/ipv4/xfrm4_output.c
++++ b/net/ipv4/xfrm4_output.c
+@@ -14,8 +14,92 @@
+ #include <net/xfrm.h>
+ #include <net/icmp.h>
+ 
++static int __xfrm4_output_finish(struct net *net, struct sock *sk,
++				 struct sk_buff *skb)
++{
++	return xfrm_output(sk, skb);
++}
++
++/* A packet offload device takes the inner packet and builds the outer
++ * packet itself, so the stack cannot fragment the outer packet as
++ * ip_output() does for a software state. xfrm_dev_offload_ok() refuses an
++ * inner packet that is longer than the inner MTU of the SA. Return that
++ * MTU if the packet has to be fragmented before it is handed to the
++ * device, 0 otherwise. IP options and a state bound to another device
++ * than the path make xfrm_dev_offload_ok() refuse a packet of any length,
++ * so such packets are left to it.
++ *
++ * Only a driver that transmits through xdo_dev_packet_xmit() encrypts
++ * every packet it is given with the state selected here. Without that
++ * callback the plaintext goes to the device, which matches it against
++ * its own policy and state rules. Those rules may skip IP fragments, as
++ * the mlx5 ones do, and the fragments would leave unencrypted.
++ */
++static unsigned int xfrm4_packet_offload_frag_mtu(struct sk_buff *skb)
++{
++#ifdef CONFIG_XFRM_OFFLOAD
++	struct dst_entry *dst = skb_dst(skb);
++	struct xfrm_state *x = dst->xfrm;
++	const struct xfrmdev_ops *ops;
++	bool packet_xmit;
++	unsigned int mtu;
++
++	if (skb_is_gso(skb) || x->props.mode != XFRM_MODE_TUNNEL ||
++	    dst_xfrm(xfrm_dst_child(dst)) || ip_hdr(skb)->ihl != 5)
++		return 0;
++
++	mtu = xfrm_state_mtu(x, ((struct xfrm_dst *)dst)->child_mtu_cached);
++	if (skb->len <= mtu || mtu < IPV4_MIN_MTU)
++		return 0;
++
++	/* The offload reference keeps the type, device and ops stable. */
++	if (!xfrm_dev_offload_get(x))
++		return 0;
++
++	ops = READ_ONCE(x->xso.state_ops);
++	packet_xmit = x->xso.type == XFRM_DEV_OFFLOAD_PACKET &&
++		      READ_ONCE(x->xso.dev) == xfrm_dst_path(dst)->dev &&
++		      ops && ops->xdo_dev_packet_xmit;
++	xfrm_dev_offload_put(x);
++
++	return packet_xmit ? mtu : 0;
++#else
++	return 0;
++#endif
++}
++
++/* RFC 4301 section 8.2.1: a packet that exceeds the MTU of the SA is
++ * fragmented if DF is clear, here before IPsec as section 5.1 allows, and
++ * discarded with an ICMP PMTU message if DF is set. DF is honoured as in
++ * ip_fragment().
++ */
++static int xfrm4_packet_offload_fragment(struct net *net, struct sock *sk,
++					 struct sk_buff *skb, unsigned int mtu)
++{
++	u16 frag_max_size = IPCB(skb)->frag_max_size;
++
++	if ((ip_hdr(skb)->frag_off & htons(IP_DF)) &&
++	    (!skb->ignore_df || frag_max_size > mtu)) {
++		IP_INC_STATS(net, IPSTATS_MIB_FRAGFAILS);
++		skb->protocol = htons(ETH_P_IP);
++		if (skb->sk && sk_fullsock(skb->sk))
++			xfrm_local_error(skb, mtu);
++		else
++			icmp_send(skb, ICMP_DEST_UNREACH, ICMP_FRAG_NEEDED,
++				  htonl(mtu));
++		kfree_skb_reason(skb, SKB_DROP_REASON_PKT_TOO_BIG);
++		return -EMSGSIZE;
++	}
++
++	if (!frag_max_size || frag_max_size > mtu)
++		IPCB(skb)->frag_max_size = mtu;
++
++	return ip_do_fragment(net, sk, skb, __xfrm4_output_finish);
++}
++
+ static int __xfrm4_output(struct net *net, struct sock *sk, struct sk_buff *skb)
+ {
++	unsigned int mtu;
+ #ifdef CONFIG_NETFILTER
+ 	struct xfrm_state *x = skb_dst(skb)->xfrm;
+ 
+@@ -25,6 +109,11 @@ static int __xfrm4_output(struct net *ne
+ 	}
+ #endif
+ 
++	/* Decide before xfrm_output() clears the control block. */
++	mtu = xfrm4_packet_offload_frag_mtu(skb);
++	if (unlikely(mtu))
++		return xfrm4_packet_offload_fragment(net, sk, skb, mtu);
++
+ 	return xfrm_output(sk, skb);
+ }
+ 

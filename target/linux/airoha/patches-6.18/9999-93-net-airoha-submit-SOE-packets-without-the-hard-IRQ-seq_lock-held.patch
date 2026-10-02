@@ -1,0 +1,239 @@
+From: hurrhnn <hurrhnn@icmp.kr>
+Date: Sat, 3 Oct 2026 05:22:32 +0900
+Subject: [PATCH] net: airoha: submit SOE packets without the hard-IRQ seq_lock held
+
+airoha_soe_submit_prepared_skb() called dev->soe_xmit_skb() with
+soe->seq_lock held by spin_lock_irqsave() and sa->lock nested inside.
+airoha_qdma_xmit_skb() takes q->lock with spin_lock_bh(), so its
+spin_unlock_bh() enabled bottom halves with hard interrupts disabled
+and could run pending softirqs, SOE RX completion included, inside the
+seq_lock section. The PPE bind helpers nested sa->lock inside seq_lock
+as well. seq_lock is also taken by the SOE interrupt handler, so a CPU
+that holds sa->lock and takes the SOE interrupt deadlocks against a
+CPU that holds seq_lock and waits for sa->lock.
+
+Take sa->lock with BH disabled first and nest seq_lock inside it in the
+submit path and in every PPE bind helper. The submit path keeps the
+seq_stopped, provider, SA and bind barrier checks, the completion tag
+reservation and the queued_ctx/active_ctx accounting in one seq_lock
+section, then drops seq_lock and hands the packet to QDMA with only
+sa->lock held. A failed transmit is rolled back within the same
+sa->lock hold and releases active_ctx through
+airoha_soe_active_ctx_sub() once sa->lock is dropped. That helper now
+re-reads active_ctx under seq_lock before declaring a bind generation
+drained, because a context reserved after the counter dropped to zero
+would otherwise let a PPE bind complete while that context is still in
+flight.
+
+The SOE interrupt and the bind barrier therefore still observe every
+reservation, per-SA submission order still follows reservation order,
+and the lock order becomes sa->lock -> seq_lock -> state_lock and
+sa->lock -> q->lock, with no BH-class lock or QDMA transmit under a
+lock that the SOE interrupt takes.
+
+Signed-off-by: hurrhnn <hurrhnn@icmp.kr>
+---
+--- a/drivers/net/ethernet/airoha/airoha_soe.c
++++ b/drivers/net/ethernet/airoha/airoha_soe.c
+@@ -560,8 +560,8 @@ bool airoha_soe_ppe_flow_bind_start(stru
+ 	*ready = false;
+ 	sa = flow->sa;
+ 	soe = flow->soe;
++	spin_lock_bh(&sa->lock);
+ 	spin_lock_irqsave(&soe->seq_lock, flags);
+-	spin_lock(&sa->lock);
+ 	if (flow->sa == sa && flow->soe == soe && sa->soe == soe && !sa->dead &&
+ 	    !flow->bound) {
+ 		if (!flow->bind_preparing) {
+@@ -581,8 +581,8 @@ bool airoha_soe_ppe_flow_bind_start(stru
+ 			 soe->ppe_bind_drained_generation;
+ 		started = true;
+ 	}
+-	spin_unlock(&sa->lock);
+ 	spin_unlock_irqrestore(&soe->seq_lock, flags);
++	spin_unlock_bh(&sa->lock);
+ 
+ 	return started;
+ }
+@@ -599,13 +599,13 @@ bool airoha_soe_ppe_flow_bind_ready(stru
+ 
+ 	sa = flow->sa;
+ 	soe = flow->soe;
++	spin_lock_bh(&sa->lock);
+ 	spin_lock_irqsave(&soe->seq_lock, flags);
+-	spin_lock(&sa->lock);
+ 	ready = flow->sa == sa && flow->soe == soe && sa->soe == soe &&
+ 		!sa->dead && !flow->bound && flow->bind_preparing &&
+ 		flow->bind_generation <= soe->ppe_bind_drained_generation;
+-	spin_unlock(&sa->lock);
+ 	spin_unlock_irqrestore(&soe->seq_lock, flags);
++	spin_unlock_bh(&sa->lock);
+ 
+ 	return ready;
+ }
+@@ -645,8 +645,8 @@ bool airoha_soe_ppe_flow_bind_finish(str
+ 
+ 	sa = flow->sa;
+ 	soe = flow->soe;
++	spin_lock_bh(&sa->lock);
+ 	spin_lock_irqsave(&soe->seq_lock, flags);
+-	spin_lock(&sa->lock);
+ 	if (flow->sa == sa && flow->soe == soe && sa->soe == soe && !sa->dead &&
+ 	    !flow->bound && flow->bind_preparing &&
+ 	    flow->bind_generation <= soe->ppe_bind_drained_generation) {
+@@ -655,8 +655,8 @@ bool airoha_soe_ppe_flow_bind_finish(str
+ 		flush_tx = airoha_soe_ppe_bind_end_locked(soe);
+ 		bound = true;
+ 	}
+-	spin_unlock(&sa->lock);
+ 	spin_unlock_irqrestore(&soe->seq_lock, flags);
++	spin_unlock_bh(&sa->lock);
+ 	if (flush_tx)
+ 		schedule_work(&soe->bind_tx_work);
+ 
+@@ -676,8 +676,8 @@ bool airoha_soe_ppe_flow_bind_share(stru
+ 
+ 	sa = flow->sa;
+ 	soe = flow->soe;
++	spin_lock_bh(&sa->lock);
+ 	spin_lock_irqsave(&soe->seq_lock, flags);
+-	spin_lock(&sa->lock);
+ 	if (flow->sa == sa && flow->soe == soe && sa->soe == soe &&
+ 	    source->sa == sa && source->soe == soe && source->input &&
+ 	    source->bound && !source->bind_preparing && flow->input &&
+@@ -685,8 +685,8 @@ bool airoha_soe_ppe_flow_bind_share(stru
+ 		flow->bound = true;
+ 		bound = true;
+ 	}
+-	spin_unlock(&sa->lock);
+ 	spin_unlock_irqrestore(&soe->seq_lock, flags);
++	spin_unlock_bh(&sa->lock);
+ 
+ 	return bound;
+ }
+@@ -708,8 +708,8 @@ bool airoha_soe_ppe_flow_bind_clone(stru
+ 	if (!sa || !soe)
+ 		return false;
+ 
++	spin_lock_bh(&sa->lock);
+ 	spin_lock_irqsave(&soe->seq_lock, flags);
+-	spin_lock(&sa->lock);
+ 	if (source->sa == sa && source->soe == soe && sa->soe == soe &&
+ 	    source->input && source->bound && !source->bind_preparing &&
+ 	    !sa->dead) {
+@@ -721,8 +721,8 @@ bool airoha_soe_ppe_flow_bind_clone(stru
+ 		list_add_tail(&flow->soe_node, &soe->ppe_flows);
+ 		bound = true;
+ 	}
+-	spin_unlock(&sa->lock);
+ 	spin_unlock_irqrestore(&soe->seq_lock, flags);
++	spin_unlock_bh(&sa->lock);
+ 
+ 	return bound;
+ }
+@@ -739,15 +739,15 @@ void airoha_soe_ppe_flow_bind_abort(stru
+ 
+ 	sa = flow->sa;
+ 	soe = flow->soe;
++	spin_lock_bh(&sa->lock);
+ 	spin_lock_irqsave(&soe->seq_lock, flags);
+-	spin_lock(&sa->lock);
+ 	if (flow->sa == sa && flow->soe == soe && sa->soe == soe &&
+ 	    flow->bind_preparing) {
+ 		flow->bind_preparing = false;
+ 		flush_tx = airoha_soe_ppe_bind_end_locked(soe);
+ 	}
+-	spin_unlock(&sa->lock);
+ 	spin_unlock_irqrestore(&soe->seq_lock, flags);
++	spin_unlock_bh(&sa->lock);
+ 	if (flush_tx)
+ 		schedule_work(&soe->bind_tx_work);
+ }
+@@ -763,12 +763,12 @@ void airoha_soe_ppe_flow_unbind(struct a
+ 
+ 	sa = flow->sa;
+ 	soe = flow->soe;
++	spin_lock_bh(&sa->lock);
+ 	spin_lock_irqsave(&soe->seq_lock, flags);
+-	spin_lock(&sa->lock);
+ 	if (flow->sa == sa && flow->soe == soe && sa->soe == soe && flow->bound)
+ 		flow->bound = false;
+-	spin_unlock(&sa->lock);
+ 	spin_unlock_irqrestore(&soe->seq_lock, flags);
++	spin_unlock_bh(&sa->lock);
+ }
+ 
+ static void airoha_soe_active_ctx_sub(struct airoha_soe *soe,
+@@ -785,7 +785,7 @@ static void airoha_soe_active_ctx_sub(st
+ 		active = 0;
+ 	}
+ 	spin_lock_irqsave(&soe->seq_lock, flags);
+-	if (!active && soe->ppe_bind_active) {
++	if (!active && !atomic_read(&soe->active_ctx) && soe->ppe_bind_active) {
+ 		soe->ppe_bind_drained_generation = soe->ppe_bind_generation;
+ 		bind_ready = true;
+ 	}
+@@ -2370,15 +2370,16 @@ airoha_soe_submit_prepared_skb(struct ai
+ 		return -ENODEV;
+ 
+ 	head = ctx->dir == AIROHA_SOE_CTX_OUT ? &sa->tx_queue : &sa->rx_queue;
++	spin_lock_bh(&sa->lock);
+ 	spin_lock_irqsave(&sa->soe->seq_lock, flags);
+ 	if (sa->soe->seq_stopped) {
+ 		spin_unlock_irqrestore(&sa->soe->seq_lock, flags);
++		spin_unlock_bh(&sa->lock);
+ 		return -EAGAIN;
+ 	}
+-	spin_lock(&sa->lock);
+ 	if (sa->dead || !airoha_soe_available(sa->soe)) {
+-		spin_unlock(&sa->lock);
+ 		spin_unlock_irqrestore(&sa->soe->seq_lock, flags);
++		spin_unlock_bh(&sa->lock);
+ 		return -ENOENT;
+ 	}
+ 	untracked = ctx->dir == AIROHA_SOE_CTX_OUT && ctx->tx.ppe_key_valid;
+@@ -2389,8 +2390,8 @@ airoha_soe_submit_prepared_skb(struct ai
+ 			err = -EAGAIN;
+ 		else
+ 			err = airoha_soe_defer_tx_locked(sa, dev, skb, ctx, x);
+-		spin_unlock(&sa->lock);
+ 		spin_unlock_irqrestore(&sa->soe->seq_lock, flags);
++		spin_unlock_bh(&sa->lock);
+ 		return err;
+ 	}
+ 	ctx->tx.deferred_skb = NULL;
+@@ -2415,8 +2416,8 @@ airoha_soe_submit_prepared_skb(struct ai
+ 								 x);
+ 			else
+ 				err = -EAGAIN;
+-			spin_unlock(&sa->lock);
+ 			spin_unlock_irqrestore(&sa->soe->seq_lock, flags);
++			spin_unlock_bh(&sa->lock);
+ 			return err;
+ 		}
+ 		__set_bit(seq, &sa->completion_seq_map);
+@@ -2436,6 +2437,7 @@ airoha_soe_submit_prepared_skb(struct ai
+ 		atomic_inc(&sa->soe->active_ctx);
+ 		reinit_completion(&sa->idle);
+ 	}
++	spin_unlock_irqrestore(&sa->soe->seq_lock, flags);
+ 
+ 	err = dev->soe_xmit_skb(dev, skb, msg0, msg1,
+ 				AIROHA_SOE_TXMSG2_DEFAULT);
+@@ -2445,13 +2447,13 @@ airoha_soe_submit_prepared_skb(struct ai
+ 				      ctx->completion_tag),
+ 			    &sa->completion_seq_map);
+ 		atomic_dec(&sa->soe->queued_ctx);
+-		atomic_dec(&sa->soe->active_ctx);
+ 		sa->inflight--;
+ 		if (sa->dead && !sa->inflight)
+ 			complete(&sa->idle);
+ 	}
+-	spin_unlock(&sa->lock);
+-	spin_unlock_irqrestore(&sa->soe->seq_lock, flags);
++	spin_unlock_bh(&sa->lock);
++	if (err && !untracked)
++		airoha_soe_active_ctx_sub(sa->soe, 1);
+ 	if (!err && untracked)
+ 		airoha_soe_free_ctx(ctx);
+ 

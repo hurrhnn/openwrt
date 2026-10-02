@@ -1,0 +1,29 @@
+From: hurrhnn <hurrhnn@icmp.kr>
+Date: Sun, 4 Oct 2026 03:30:00 +0900
+Subject: [PATCH] net: airoha: hash decrypted SOE packets by their inner header
+
+The RX path sets the hash of an incoming ESP packet from its outer FOE
+entry, and airoha_soe_complete_in() restores the header of that packet
+onto the decrypted result, hash included. Every inner flow of an SA
+therefore carries the same L4 hash: RPS steers them all to one CPU and
+a flow hashing qdisc on the LAN egress puts them into one flow.
+
+Clear the hash of the decrypted packet so that it is computed from its
+own header when it is needed.
+
+Signed-off-by: hurrhnn <hurrhnn@icmp.kr>
+---
+--- a/drivers/net/ethernet/airoha/airoha_soe.c
++++ b/drivers/net/ethernet/airoha/airoha_soe.c
+@@ -3233,6 +3233,11 @@ static bool airoha_soe_complete_in(struc
+ 	if (rx_protocol == htons(ETH_P_XDSA))
+ 		skb->protocol = rx_protocol;
+ 	skb->ip_summed = CHECKSUM_NONE;
++	/* The restored header carries the receive hash of the outer ESP
++	 * packet, which all inner flows of the SA share. Let RPS and flow
++	 * hashing qdiscs hash the decrypted packet by its own header.
++	 */
++	skb_clear_hash(skb);
+ 	skb_reset_mac_len(skb);
+ 	skb->encapsulation = 0;
+ 	skb->mark = xfrm_smark_get(skb->mark, x);

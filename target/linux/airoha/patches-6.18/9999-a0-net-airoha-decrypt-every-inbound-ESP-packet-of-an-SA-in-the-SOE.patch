@@ -1,0 +1,354 @@
+From: hurrhnn <hurrhnn@icmp.kr>
+Date: Sun, 4 Oct 2026 02:00:00 +0900
+Subject: [PATCH] net: airoha: decrypt every inbound ESP packet of an SA in the SOE
+
+Inbound SAs are created with their PPE path disabled, so their outer
+ESP FOE entry never binds. The PPE still learns that entry and reports
+every later packet of the SA as a hit on an unbound entry, and the RX
+path left all such packets to software XFRM. Only the few packets that
+arrived before the entry was learned reached the SOE, so inbound IPsec
+was effectively decrypted in software.
+
+For a native-ESP inbound SA that cannot own a PPE entry, submit every
+ESP packet from the peer address of the SA to the SOE, whether its FOE
+entry is learned or not. The FOE state now only decides whether the
+authenticated inner packet carries the outer FOE index for the
+flowtable, as software-decrypted packets always did. The hop
+descriptor of a CPU request no longer references a FOE entry.
+
+Software XFRM remains the fallback when the in-flight window of the SA
+is full, while an outbound PPE bind drains CPU requests, while the
+engine is stopped for an expiring SA, when no context can be allocated,
+and for packets the SOE cannot parse (fragments, IP options) or that
+come from another source address. UDP-encapsulated SAs keep the
+existing learning split.
+
+Hand decrypted packets to GRO on the NAPI context of the ring that
+returned the completion. The replay window has already advanced for
+each packet, so this matches the gro_cells hand-off at the end of
+software xfrm_input(); the XFRM policy check runs once on the merged
+packet with the secpath of the first segment.
+
+Count hardware-rejected inbound packets as XfrmInStateProtoError.
+
+The error worker disabled the provider when a decrypt error interrupt
+overlapped a queued inbound request of any SA. An SA without the
+*_ERR_DROP command bits returns a failed packet as a tagged completion
+that pops its own context, and a request that is lost anyway is
+released by the context timeout and the idle sweep. Keep the fault
+only for SAs that drop failed packets in hardware, so that one forged
+or malformed ESP packet cannot disable the provider for every SA.
+
+Signed-off-by: hurrhnn <hurrhnn@icmp.kr>
+---
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -1442,7 +1442,7 @@ static int airoha_qdma_rx_process(struct
+ 
+ 			done++;
+ 			if (!airoha_soe_rx_skb(eth->soe, q->skb, completion_tag,
+-					       hop_flags))
++					       hop_flags, &q->napi))
+ 				dev_kfree_skb(q->skb);
+ 			q->skb = NULL;
+ 			continue;
+--- a/drivers/net/ethernet/airoha/airoha_soe.c
++++ b/drivers/net/ethernet/airoha/airoha_soe.c
+@@ -156,6 +156,10 @@
+ #define AIROHA_SOE_SA_CMD_ECN_MODE BIT(28)
+ #define AIROHA_SOE_SA_CMD_DEC_UDP_PARSER_EN BIT(29)
+ #define AIROHA_SOE_SA_CMD_VLD BIT(31)
++#define AIROHA_SOE_SA_CMD_ERR_DROP \
++	(AIROHA_SOE_SA_CMD_SN_ERR_DROP | \
++	 AIROHA_SOE_SA_CMD_PAD_ERR_DROP | \
++	 AIROHA_SOE_SA_CMD_ICV_ERR_DROP)
+ 
+ #define AIROHA_SOE_CIPHER_AES_CBC 1
+ #define AIROHA_SOE_CIPHER_AES_GCM 2
+@@ -971,6 +975,12 @@ static void airoha_soe_error_work(struct
+ 	/* Error interrupts have no CPU-submission cookie. If an error can
+ 	 * overlap a queued request, continuing would leave that request pending
+ 	 * indefinitely. Stop the provider and discard the ambiguous queue.
++	 *
++	 * An inbound SA without the *_ERR_DROP command bits returns a failed
++	 * packet as a tagged completion, which pops its own context. A request
++	 * that is lost anyway is released by the context timeout and the idle
++	 * sweep. A forged or replayed ESP packet on such an SA must therefore
++	 * not disable the provider for every SA.
+ 	 */
+ 	rcu_read_lock();
+ 	for (i = 0; i < AIROHA_SOE_NUM_SA && !queued; i++) {
+@@ -978,9 +988,11 @@ static void airoha_soe_error_work(struct
+ 
+ 		if (!sa)
+ 			continue;
+-		if ((sa_pending & BIT(i)) ||
+-		    (pending & AIROHA_SOE_INT_DEC_PACKET_ERROR) ||
+-		    ((pending & AIROHA_SOE_INT_DEC_SA_ERROR) && !sa_pending))
++		if (!(sa->cmd & AIROHA_SOE_SA_CMD_ENC) &&
++		    (sa->cmd & AIROHA_SOE_SA_CMD_ERR_DROP) &&
++		    ((sa_pending & BIT(i)) ||
++		     (pending & AIROHA_SOE_INT_DEC_PACKET_ERROR) ||
++		     ((pending & AIROHA_SOE_INT_DEC_SA_ERROR) && !sa_pending)))
+ 			queued = airoha_soe_sa_has_queued_ctx(sa,
+ 							      AIROHA_SOE_CTX_IN);
+ 		if (!queued && (pending & AIROHA_SOE_INT_ENC_PACKET_ERROR))
+@@ -2302,7 +2314,7 @@ static int airoha_soe_push_l2_header(str
+ }
+ 
+ static void airoha_soe_push_hop_desc(struct sk_buff *skb, unsigned int sa_index,
+-				     bool encrypt, u16 foe_hash, bool foe_valid)
++				     bool encrypt)
+ {
+ 	u32 hop_direction = encrypt ? AIROHA_SOE_HOP_INFO_ENCRYPT :
+ 				      AIROHA_SOE_HOP_INFO_DECRYPT;
+@@ -2313,8 +2325,10 @@ static void airoha_soe_push_hop_desc(str
+ 	desc[0] = cpu_to_le64(encrypt ? AIROHA_SOE_HOP_DESC0_ENCRYPT :
+ 					AIROHA_SOE_HOP_DESC0_DECRYPT);
+ 	desc[1] = cpu_to_le64(AIROHA_SOE_HOP_DESC1);
+-	if (foe_valid)
+-		desc[2] = cpu_to_le64((u64)foe_hash << 32);
++	/* desc[2] would carry a FOE index for the PPE. CPU-path requests
++	 * must not reference a FOE entry: the outer ESP entry of an inbound
++	 * SA stays unbound, and the flowtable tag lives in the secpath only.
++	 */
+ 	desc[3] = cpu_to_le64(desc3);
+ 	((u8 *)desc)[28] = sa_index;
+ 
+@@ -2424,9 +2438,7 @@ airoha_soe_submit_prepared_skb(struct ai
+ 		ctx->tx.deferred_sa = NULL;
+ 		ctx->tx.deferred_dev = NULL;
+ 	}
+-	airoha_soe_push_hop_desc(skb, sa->index, encrypt, ctx->rx.foe_hash,
+-				 ctx->dir == AIROHA_SOE_CTX_IN &&
+-				 ctx->rx.foe_valid);
++	airoha_soe_push_hop_desc(skb, sa->index, encrypt);
+ 
+ 	ctx->submitted = jiffies;
+ 	list_add_tail(&ctx->list, head);
+@@ -2692,6 +2704,19 @@ static bool airoha_soe_rx_parse_ipv4(str
+ 	return true;
+ }
+ 
++/* Tag a packet that software XFRM will decrypt so that the flowtable sees
++ * the same outer FOE index as for an SOE-decrypted packet of the same SA.
++ */
++static void airoha_soe_rx_tag_flow(struct sk_buff *skb, u16 foe_hash)
++{
++	struct sec_path *sp = secpath_set(skb);
++
++	if (sp && !sp->len && !sp->olen) {
++		sp->ovec[0].hw_flow_id = foe_hash;
++		sp->ovec[0].flags |= XFRM_HW_FLOW_ID;
++	}
++}
++
+ /* Plain ESP/NAT-T first arrives as normal RX, then is bounced to SOE decrypt. */
+ bool airoha_soe_rx_plain_skb(struct airoha_gdm_dev *dev, struct sk_buff *skb,
+ 			     struct net_device *rx_dev, u16 foe_hash,
+@@ -2700,31 +2725,31 @@ bool airoha_soe_rx_plain_skb(struct airo
+ 	const struct xfrmdev_ops *ops;
+ 	struct airoha_soe_xfrm_state *state;
+ 	struct airoha_soe_rx_info info = {};
++	struct airoha_soe *soe;
+ 	struct airoha_soe_sa *sa;
+ 	struct airoha_soe_ctx *ctx;
+ 	struct sec_path *sp;
+ 	xfrm_address_t daddr = {};
+ 	struct xfrm_state *x;
++	bool soe_default;
++	bool flow_tag;
+ 	int err;
+ 
+ 	if (!dev || !skb || !rx_dev)
+ 		return false;
+ 
+-	if (!airoha_soe_available(dev->eth->soe) ||
++	soe = dev->eth->soe;
++	if (!airoha_soe_available(soe) ||
+ 	    !(rx_dev->features & NETIF_F_HW_ESP))
+ 		return false;
+ 
+ 	if (!atomic_read(&dev->soe_xfrm_state_count))
+ 		return false;
+-	/* Bound PPE entries can still punt keepalive and exception packets to the
+-	 * CPU. Let normal software XFRM handle them without attempting to learn
+-	 * the already-bound entry again.
++	/* Only a hit on an unbound FOE entry at the bind rate may tag the
++	 * authenticated inner packet for flowtable admission. This is the
++	 * same rule the software-decrypt path has always applied.
+ 	 */
+-	if (foe_valid && !foe_unbound)
+-		return false;
+-	if (airoha_soe_ppe_bind_is_active(dev->eth->soe) &&
+-	    !(foe_valid && foe_unbound))
+-		return false;
++	flow_tag = foe_valid && foe_unbound;
+ 
+ 	if (!airoha_soe_rx_parse_ipv4(skb, &info))
+ 		return false;
+@@ -2766,30 +2791,44 @@ bool airoha_soe_rx_plain_skb(struct airo
+ 		goto drop_state;
+ 	}
+ 	sa = state->sa;
++	/* A native-ESP inbound SA that can never own an autonomous PPE entry
++	 * is decrypted by the SOE for every packet that reaches the CPU. Its
++	 * outer FOE state only selects the flowtable tag, never the decrypt
++	 * path. A packet from any other source cannot authenticate; leave it
++	 * to software XFRM so that it never raises an engine error.
++	 */
++	soe_default = !x->encap && READ_ONCE(sa->ppe_disabled);
++	if (soe_default && info.saddr != x->props.saddr.a4)
++		goto unlock_state;
+ 	spin_unlock(&x->lock);
+ 
+-	/* Let the normal XFRM path authenticate and decrypt the flow-learning
+-	 * packet. Preserve its hardware flow ID in the unused offload slot; both
+-	 * GRO and non-GRO XFRM input retain the slot until flowtable sees the
+-	 * authenticated inner packet.
+-	 */
+-	if (foe_valid) {
+-		sp = secpath_set(skb);
+-		if (sp && !sp->len && !sp->olen) {
+-			sp->ovec[0].hw_flow_id = foe_hash;
+-			sp->ovec[0].flags |= XFRM_HW_FLOW_ID;
+-		}
+-		xfrm_dev_offload_put(x);
+-		xfrm_state_put(x);
+-		return false;
++	if (!soe_default) {
++		/* NAT-T inbound SAs keep the learning split: bound-entry
++		 * exceptions and flow-learning packets stay in software.
++		 * Preserve the hardware flow ID in the unused offload slot;
++		 * both GRO and non-GRO XFRM input retain it until flowtable
++		 * sees the authenticated inner packet.
++		 */
++		if (foe_valid && !foe_unbound)
++			goto put_state;
++		if (airoha_soe_ppe_bind_is_active(soe) && !flow_tag)
++			goto put_state;
++		if (flow_tag)
++			goto sw_tag;
++	} else if (airoha_soe_ppe_bind_is_active(soe) ||
++		   READ_ONCE(soe->seq_stopped)) {
++		/* An outbound PPE bind is draining CPU requests, or the engine
++		 * is stopped for an expiring SA. Do not hold this packet back.
++		 */
++		goto sw_tag;
+ 	}
+ 
+ 	if (READ_ONCE(sa->inflight) >= AIROHA_SOE_SA_INFLIGHT_MAX)
+-		goto put_state;
++		goto sw_tag;
+ 
+ 	ctx = kzalloc_obj(*ctx, GFP_ATOMIC);
+ 	if (!ctx)
+-		goto put_state;
++		goto sw_tag;
+ 
+ 	ctx->dir = AIROHA_SOE_CTX_IN;
+ 	ctx->rx.x = x;
+@@ -2798,7 +2837,7 @@ bool airoha_soe_rx_plain_skb(struct airo
+ 	ctx->rx.sport = info.sport;
+ 	ctx->rx.seq = info.seq;
+ 	ctx->rx.foe_hash = foe_hash;
+-	ctx->rx.foe_valid = foe_valid;
++	ctx->rx.foe_valid = flow_tag;
+ 
+ 	/* Allocate and validate the secpath before hardware advances its replay
+ 	 * window. The metadata clone preserves this writable extension until RX
+@@ -2828,6 +2867,10 @@ drop_state:
+ 	xfrm_state_put(x);
+ 	kfree_skb(skb);
+ 	return true;
++sw_tag:
++	if (flow_tag)
++		airoha_soe_rx_tag_flow(skb, foe_hash);
++	goto put_state;
+ unlock_state:
+ 	spin_unlock(&x->lock);
+ put_state:
+@@ -2888,7 +2931,8 @@ drop:
+ }
+ 
+ static bool airoha_soe_complete_in(struct sk_buff *skb,
+-				   struct airoha_soe_ctx *ctx)
++				   struct airoha_soe_ctx *ctx,
++				   struct napi_struct *napi)
+ {
+ 	struct xfrm_state *x = ctx->rx.x;
+ 	struct xfrm_offload *xo;
+@@ -2968,7 +3012,16 @@ static bool airoha_soe_complete_in(struc
+ 
+ 	nf_reset_ct(skb);
+ 	kfree(ctx);
+-	netif_rx(skb);
++	/* The replay window has already advanced for this packet, so GRO may
++	 * merge it with later packets of the same inner flow, exactly like the
++	 * gro_cells hand-off at the end of software xfrm_input(). The secpath
++	 * of the first segment is kept and the policy check runs once on the
++	 * merged skb.
++	 */
++	if (napi)
++		napi_gro_receive(napi, skb);
++	else
++		netif_rx(skb);
+ 
+ 	return true;
+ 
+@@ -2979,7 +3032,8 @@ drop:
+ }
+ 
+ bool airoha_soe_rx_skb(struct airoha_soe *soe, struct sk_buff *skb,
+-		       unsigned int completion_tag, u32 hop_flags)
++		       unsigned int completion_tag, u32 hop_flags,
++		       struct napi_struct *napi)
+ {
+ 	enum airoha_soe_ctx_dir dir;
+ 	struct airoha_soe_ctx *ctx;
+@@ -3006,6 +3060,14 @@ bool airoha_soe_rx_skb(struct airoha_soe
+ 			       AIROHA_SOE_HOP_FLAG_ENCRYPTED :
+ 			       AIROHA_SOE_HOP_FLAG_DECRYPTED;
+ 	if (hop_flags != success_flag) {
++		struct xfrm_state *x = READ_ONCE(sa->x);
++
++		/* Keep hardware-rejected inbound packets (ICV, sequence or
++		 * padding failures) visible in /proc/net/xfrm_stat.
++		 */
++		if (dir == AIROHA_SOE_CTX_IN && x)
++			XFRM_INC_STATS(xs_net(x),
++				       LINUX_MIB_XFRMINSTATEPROTOERROR);
+ 		rcu_read_unlock();
+ 		if (hop_flags == (dir == AIROHA_SOE_CTX_OUT ?
+ 				  AIROHA_SOE_HOP_FLAG_DECRYPTED :
+@@ -3035,7 +3097,7 @@ bool airoha_soe_rx_skb(struct airoha_soe
+ 	if (dir == AIROHA_SOE_CTX_OUT)
+ 		airoha_soe_complete_out(skb, ctx);
+ 	else
+-		airoha_soe_complete_in(skb, ctx);
++		airoha_soe_complete_in(skb, ctx, napi);
+ 	airoha_soe_finish_ctx(sa);
+ 
+ 	return true;
+--- a/drivers/net/ethernet/airoha/airoha_soe.h
++++ b/drivers/net/ethernet/airoha/airoha_soe.h
+@@ -83,7 +83,8 @@ void airoha_soe_teardown_netdev(struct n
+ int airoha_soe_set_features(struct net_device *dev, netdev_features_t features);
+ bool airoha_soe_rx_is_completion(const void *data, size_t len, u32 msg0);
+ bool airoha_soe_rx_skb(struct airoha_soe *soe, struct sk_buff *skb,
+-		       unsigned int completion_tag, u32 hop_flags);
++		       unsigned int completion_tag, u32 hop_flags,
++		       struct napi_struct *napi);
+ bool airoha_soe_rx_drop(struct airoha_soe *soe,
+ 			unsigned int completion_tag);
+ bool airoha_soe_rx_plain_skb(struct airoha_gdm_dev *dev, struct sk_buff *skb,
+@@ -159,7 +160,8 @@ static inline bool airoha_soe_rx_is_comp
+ 
+ static inline bool airoha_soe_rx_skb(struct airoha_soe *soe,
+ 				     struct sk_buff *skb,
+-				     unsigned int completion_tag, u32 hop_flags)
++				     unsigned int completion_tag, u32 hop_flags,
++				     struct napi_struct *napi)
+ {
+ 	return false;
+ }

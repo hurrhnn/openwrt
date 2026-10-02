@@ -310,6 +310,10 @@
 	status = "okay";
 };
 
+&soe {
+	status = "okay";
+};
+
 &gdm1 {
 	status = "okay";
 

@@ -1,0 +1,104 @@
+From: hurrhnn <hurrhnn@icmp.kr>
+Date: Sun, 4 Oct 2026 00:30:00 +0900
+Subject: [PATCH] xfrm: keep one egress flow hash per SA
+
+An outbound SA numbers its packets in xfrm_output_one(), before they
+reach the qdisc and the tx queue selection of the egress device. The
+peer drops a packet whose sequence number has fallen behind its replay
+window, so the packets of an SA have to leave close to the order in
+which they were numbered.
+
+The transformed packet keeps the skb->hash of the inner packet, the
+receive hash of a forwarded packet or the socket hash of a local one.
+Flow hashing qdiscs and the hash based tx queue selection of
+skb_tx_hash() and XPS therefore still see the inner flows and split one
+SA by them. fq_codel puts every inner flow of the SA into its own
+bucket, and its DRR and new flow scheduling send packets with newer
+sequence numbers ahead of an older backlog. With a software ESP SA,
+every TCP retransmission of an upload through the tunnel matched a
+packet that the peer had dropped as too old for its replay window, and
+the drops stopped when all packets of the SA were kept in one fq_codel
+bucket.
+
+Clearing the hash, so that the flow dissector hashes the outer header,
+is not enough for IPv6: tunnel mode copies the flow label of an inner
+IPv6 packet into the outer header, and the dissector stops at a
+non-zero flow label.
+
+Set a software L4 hash computed from the state instead, from its
+addresses, protocol and SPI, for ESP and AH states, the states with
+replay protection. It is set once the outer header has been added and
+before the packet is numbered, so it is also carried by packets that
+complete through asynchronous crypto, by ESP GSO and crypto offload
+packets, which are encrypted after the qdisc, and by the GSO segments
+made from a packet later on. With nested states the outermost one sets
+the hash. Different SAs still hash apart.
+
+The inner flows of one SA lose their fq_codel isolation from each
+other. RFC 4301 section 4.1 already expects a sender to put traffic
+classes that are scheduled apart on different SAs, because the replay
+window of the receiver would discard the packets that fall behind.
+
+A tx queue choice that does not use the hash, such as one made from
+skb->priority or from the XPS map of the sending CPU, can still split
+an SA. The slow path fragments of a locally generated packet take the
+socket hash again in skb_set_owner_w().
+
+Packet offload states skip this part of xfrm_output_one() and are not
+changed.
+
+Signed-off-by: hurrhnn <hurrhnn@icmp.kr>
+---
+--- a/net/xfrm/xfrm_output.c
++++ b/net/xfrm/xfrm_output.c
+@@ -525,6 +525,41 @@ unlock:
+ }
+ EXPORT_SYMBOL_GPL(xfrm_dev_packet_state_check);
+ 
++/* The packets of an SA share its sequence number space and have to leave
++ * in the order in which they are numbered. Hash them by the SA, not by
++ * the inner flow, so that flow hashing qdiscs and hash based tx queue
++ * selection do not reorder them across the peer's replay window.
++ */
++static void xfrm_set_flow_hash(struct sk_buff *skb,
++			       const struct xfrm_state *x)
++{
++	struct flow_keys keys;
++
++	if (!(x->type->flags & XFRM_TYPE_REPLAY_PROT))
++		return;
++
++	memset(&keys, 0, sizeof(keys));
++	keys.basic.ip_proto = x->id.proto;
++	keys.ports.ports = x->id.spi;
++
++	switch (x->props.family) {
++	case AF_INET:
++		keys.control.addr_type = FLOW_DISSECTOR_KEY_IPV4_ADDRS;
++		keys.basic.n_proto = htons(ETH_P_IP);
++		keys.addrs.v4addrs.src = x->props.saddr.a4;
++		keys.addrs.v4addrs.dst = x->id.daddr.a4;
++		break;
++	case AF_INET6:
++		keys.control.addr_type = FLOW_DISSECTOR_KEY_IPV6_ADDRS;
++		keys.basic.n_proto = htons(ETH_P_IPV6);
++		keys.addrs.v6addrs.src = x->props.saddr.in6;
++		keys.addrs.v6addrs.dst = x->id.daddr.in6;
++		break;
++	}
++
++	__skb_set_sw_hash(skb, flow_hash_from_keys(&keys), true);
++}
++
+ static int xfrm_output_one(struct sk_buff *skb, int err)
+ {
+ 	struct dst_entry *dst = skb_dst(skb);
+@@ -557,6 +592,8 @@ static int xfrm_output_one(struct sk_buf
+ 			goto error_nolock;
+ 		}
+ 
++		xfrm_set_flow_hash(skb, x);
++
+ 		err = xfrm_dev_packet_state_check(x, skb);
+ 		if (err)
+ 			goto error_nolock;

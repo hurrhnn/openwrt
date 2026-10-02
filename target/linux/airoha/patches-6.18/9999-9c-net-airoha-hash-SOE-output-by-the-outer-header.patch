@@ -1,0 +1,32 @@
+From: hurrhnn <hurrhnn@icmp.kr>
+Date: Sun, 4 Oct 2026 02:40:00 +0900
+Subject: [PATCH] net: airoha: hash SOE output by the outer header
+
+airoha_soe_complete_out() sends an ESP packet that the SOE has encoded
+through the outer LOCAL_OUT path, with the header of the original
+packet restored, including the skb hash of its inner flow or socket.
+The SOE has already numbered the packet, and a flow hashing qdisc puts
+the inner flows of one SA into different flows and may send a packet
+with a newer sequence number ahead of an older one, which the peer
+drops once it falls behind its replay window.
+
+Clear the hash so that it is computed from the outer header, whose
+ports word holds the SPI, and the packets of one SA share a qdisc flow.
+The outer header of an SOE packet is IPv4.
+
+Signed-off-by: hurrhnn <hurrhnn@icmp.kr>
+---
+--- a/drivers/net/ethernet/airoha/airoha_soe.c
++++ b/drivers/net/ethernet/airoha/airoha_soe.c
+@@ -2865,6 +2865,11 @@ static bool airoha_soe_complete_out(stru
+ 	skb->ignore_df = 1;
+ 	if (sk)
+ 		skb_set_owner_w(skb, sk);
++	/* The restored header carries the hash of the inner flow or socket.
++	 * Hash the ESP packet by its outer header, which holds the SPI, so
++	 * that flow hashing qdiscs keep the packets of the SA in order.
++	 */
++	skb_clear_hash(skb);
+ 	net = dev_net(dst->dev);
+ 	ctx->tx.dst = NULL;
+ 	ctx->tx.sk = NULL;
