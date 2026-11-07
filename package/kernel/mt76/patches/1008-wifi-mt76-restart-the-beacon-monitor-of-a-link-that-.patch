@@ -1,0 +1,63 @@
+From a98d650bfe43275ac788b4ac0ba0ae83282cdbd5 Mon Sep 17 00:00:00 2001
+From: Felix Fietkau <nbd@nbd.name>
+Date: Wed, 28 Oct 2026 13:23:57 +0100
+Subject: [PATCH 1008/1012] wifi: mt76: restart the beacon monitor of a link
+ that gets a chanctx again
+
+mt7996_vif_link_remove() keeps a station link when its chanctx is
+unassigned, for example when mac80211 deactivates the link. The link
+keeps its beacon_mon_interval and the beacon_mon_last of its last
+beacon. When the link is activated again, mt7996_vif_link_add() takes
+the reuse branch, which does not touch the beacon monitor. Unless a
+beacon on that link arrives first, the next mt76_beacon_mon_check()
+reports a beacon loss for the stale timestamp, and the station
+disconnects:
+
+  sta-mld0: CTRL-EVENT-BEACON-LOSS
+  sta-mld0: CTRL-EVENT-DISCONNECTED bssid=a0:ad:9f:70:fb:4a reason=4 locally_generated=1
+
+Reset beacon_mon_last whenever a link gets a chanctx, which
+mt76_switch_vif_chanctx() already did after a channel switch. Do it
+before the link points to the chanctx, since mt76_beacon_mon_check()
+runs without dev->mutex and can see the link while vif_link_add() waits
+for the firmware.
+
+Fixes: 08813703ac41 ("wifi: mt76: mt7996: Destroy vif active links in mt7996_remove_interface()")
+Link: https://patch.msgid.link/20261028122403.796394-19-nbd@nbd.name
+Signed-off-by: Felix Fietkau <nbd@nbd.name>
+(cherry picked from commit 47665de41b5d8d65019e14096530d8796292cf55)
+---
+ channel.c | 2 --
+ mt76.h    | 3 +++
+ 2 files changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/channel.c b/channel.c
+index 7823a8d..3ac6f89 100644
+--- a/channel.c
++++ b/channel.c
+@@ -254,8 +254,6 @@ int mt76_switch_vif_chanctx(struct ieee80211_hw *hw,
+ 		}
+ 
+ 		mt76_vif_link_ctx_set(mlink, v->new_ctx);
+-		if (mlink->beacon_mon_interval)
+-			WRITE_ONCE(mlink->beacon_mon_last, jiffies);
+ 	}
+ 
+ out:
+diff --git a/mt76.h b/mt76.h
+index 714221e..8a7ff7b 100644
+--- a/mt76.h
++++ b/mt76.h
+@@ -2179,6 +2179,9 @@ static inline void
+ mt76_vif_link_ctx_set(struct mt76_vif_link *mlink,
+ 		      struct ieee80211_chanctx_conf *conf)
+ {
++	if (conf && mlink->beacon_mon_interval)
++		WRITE_ONCE(mlink->beacon_mon_last, jiffies);
++
+ 	/* pairs with smp_load_acquire() in mt76_vif_link_phy() */
+ 	smp_store_release(&mlink->ctx, conf);
+ }
+-- 
+2.47.3
+
