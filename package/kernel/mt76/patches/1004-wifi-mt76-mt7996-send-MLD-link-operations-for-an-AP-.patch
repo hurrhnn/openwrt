@@ -1,0 +1,55 @@
+From 2637486bd394eb5cb29e1f9597ad1031da5d062f Mon Sep 17 00:00:00 2001
+From: Felix Fietkau <nbd@nbd.name>
+Date: Wed, 28 Oct 2026 13:23:49 +0100
+Subject: [PATCH 1004/1012] wifi: mt76: mt7996: send MLD link operations for an
+ AP MLD only
+
+mt7996_vif_link_remove() sends the MLD reconfiguration stop and the MLD
+link removal for every AP link, and mt7996_vif_link_add() sends the MLD
+link add for every AP link it holds already. A non-MLD AP has no MLD
+group in the firmware: its BSS carries group_mld_id 0xff. The firmware
+refuses both removal commands at each teardown of a non-MLD AP:
+
+  mt7996e 0000:01:00.0: Message 00120082 (seq 1) cid 0082 failed: firmware status 0xc0000001
+  mt7996e 0000:01:00.0: Message 001a0002 (seq 2) cid 0002 failed: firmware status 0xc0000001
+
+The add sends the group_mld_id and remap_idx of the vif, which a vif
+that never was an MLD holds at 0, the first index that an AP MLD gets.
+
+Send the MLD link operations only for an AP MLD, matching the MLD tag
+of mt7996_mcu_add_bss_info(). A non-MLD AP link that is added again
+programs its BSS as a station link does.
+
+Fixes: e7ec71d9f8fa ("wifi: mt76: mt7996: Add mcu APIs to enable/disable vif links.")
+Link: https://patch.msgid.link/20261028122403.796394-11-nbd@nbd.name
+Signed-off-by: Felix Fietkau <nbd@nbd.name>
+(cherry picked from commit fecc93e7f1ed054354be2ba10698ea6de2cb35de)
+---
+ mt7996/main.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/mt7996/main.c b/mt7996/main.c
+index bb7511d..d71857d 100644
+--- a/mt7996/main.c
++++ b/mt7996/main.c
+@@ -333,7 +333,7 @@ int mt7996_vif_link_add(struct mt76_phy *mphy, struct ieee80211_vif *vif,
+ 		if (ret)
+ 			return ret;
+ 
+-		if (vif->type == NL80211_IFTYPE_AP)
++		if (vif->type == NL80211_IFTYPE_AP && ieee80211_vif_is_mld(vif))
+ 			return mt7996_mcu_mld_link_oper(dev, link_conf, link,
+ 							true);
+ 
+@@ -515,7 +515,7 @@ void mt7996_vif_link_remove(struct mt76_phy *mphy, struct ieee80211_vif *vif,
+ 	if (mlink->wcid->offchannel) {
+ 		mt7996_vif_link_destroy(phy, link, vif, link_conf);
+ 	} else {
+-		if (vif->type == NL80211_IFTYPE_AP) {
++		if (vif->type == NL80211_IFTYPE_AP && ieee80211_vif_is_mld(vif)) {
+ 			mt7996_mcu_mld_reconf_stop_link(phy->dev, vif,
+ 							BIT(link_id));
+ 			mt7996_mcu_mld_link_oper(phy->dev, link_conf, link,
+-- 
+2.47.3
+

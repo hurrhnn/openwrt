@@ -1,0 +1,228 @@
+From 10dfbc1e4a13d318f0e51506633497d11aee2144 Mon Sep 17 00:00:00 2001
+From: Claude Code <noreply@anthropic.com>
+Date: Sun, 8 Nov 2026 03:00:00 +0900
+Subject: [PATCH 1014/1015] wifi: mt76: mt7996: pass the DSCP map of hostapd to
+ the firmware
+
+Since SDO fills the TXD of an 802.3 frame, the hardware takes the TID of
+the frame from its DSCP with a table of its own. mac80211 classifies the
+same frame with cfg80211_classify8021d() and the QoS map that hostapd
+configured (OpenWrt sets qos_map_set by default). When the two tables
+disagree, the host thinks a frame is TID 0 while the hardware sends it as
+another TID:
+
+- with the OpenWrt default map, CS1 (DSCP 8) is UP 0 for mac80211, but
+  the hardware sends it as TID 1
+- mac80211 then never starts a TX BA session for TID 1, so these frames
+  go out without aggregation: about 36 Mbit/s instead of 300 Mbit/s
+  (UDP from the AP to a QCNCM865 MLO station)
+
+This is the same problem as upstream d7e3bee8 ("wifi: mt76: mt7996: pass
+the default DSCP map to the firmware"), but upstream sends the map of
+cfg80211_dscp_to_up() without a QoS map, which still differs from
+mac80211 when hostapd has a QoS map. mac80211 does not hand the QoS map
+to the driver, so mirror it with the module parameter qos_map, in the
+format of hostapd qos_map_set. Its default is the OpenWrt default; an
+empty string sends the cfg80211 default (RFC 8325) table.
+
+The table is sent with MCU_WA_EXT_CMD(SET_QOS_MAP) (or the SDO TLV
+without WA) for every new vif link, as upstream does.
+
+Tested on a Gemtek W1700K: UDP 300M from the AP with DSCP CS0, CS1,
+AF11, CS2, CS3, CS5, EF and CS6 all reach 300 Mbit/s, CS1 was 36 Mbit/s
+before.
+---
+ mt76_connac_mcu.h |   1 +
+ mt7996/main.c     |   1 +
+ mt7996/mcu.c      | 124 ++++++++++++++++++++++++++++++++++++++++++++++
+ mt7996/mcu.h      |   1 +
+ mt7996/mt7996.h   |   2 +
+ 5 files changed, 129 insertions(+)
+
+diff --git a/mt76_connac_mcu.h b/mt76_connac_mcu.h
+index d62be87..06a2a6e 100644
+--- a/mt76_connac_mcu.h
++++ b/mt76_connac_mcu.h
+@@ -1310,6 +1310,7 @@ enum {
+ 	MCU_EXT_CMD_GROUP_PRE_CAL_INFO = 0xab,
+ 	MCU_EXT_CMD_DPD_PRE_CAL_INFO = 0xac,
+ 	MCU_EXT_CMD_PHY_STAT_INFO = 0xad,
++	MCU_EXT_CMD_SET_QOS_MAP = 0xb4,
+ 	MCU_EXT_CMD_WF_RF_PIN_CTRL = 0xbd,
+ };
+ 
+diff --git a/mt7996/main.c b/mt7996/main.c
+index 5674f8e..01968bc 100644
+--- a/mt7996/main.c
++++ b/mt7996/main.c
+@@ -393,6 +393,7 @@ int mt7996_vif_link_add(struct mt76_phy *mphy, struct ieee80211_vif *vif,
+ 	mt7996_init_bitrate_mask(vif, link);
+ 
+ 	mt7996_mcu_add_bss_info(phy, vif, link_conf, mlink, msta_link, true);
++	mt7996_mcu_set_qos_map(dev, mlink);
+ 	/* defer the first STA_REC of BMC entry to BSS_CHANGED_BSSID for STA
+ 	 * interface, since firmware only records BSSID when the entry is new
+ 	 */
+diff --git a/mt7996/mcu.c b/mt7996/mcu.c
+index 2560973..e38caee 100644
+--- a/mt7996/mcu.c
++++ b/mt7996/mcu.c
+@@ -644,6 +644,130 @@ int mt7996_mcu_wa_cmd(struct mt7996_dev *dev, int cmd, u32 a1, u32 a2, u32 a3)
+ 				 sizeof(req), false);
+ }
+ 
++/* W1700K local: the DSCP -> UP table that mac80211 uses for downlink frames.
++ * hostapd hands its qos_map_set to mac80211 only, so mirror it here in the
++ * same format (DSCP exception pairs followed by eight low,high ranges).
++ * An empty string means no QoS map (cfg80211 default, RFC 8325).
++ */
++static char *mt7996_qos_map = "0,0,2,16,1,1,255,255,18,22,24,38,40,40,44,46,48,56";
++module_param_named(qos_map, mt7996_qos_map, charp, 0444);
++MODULE_PARM_DESC(qos_map, "hostapd qos_map_set mirrored to the firmware DSCP table");
++
++static int mt7996_parse_qos_map(struct cfg80211_qos_map *map)
++{
++	u8 val[16 + 2 * IEEE80211_QOS_MAP_MAX_EX];
++	char *buf, *p, *tok;
++	int n = 0, i, ret = 0;
++
++	if (!mt7996_qos_map || !*mt7996_qos_map)
++		return -ENOENT;
++
++	buf = kstrdup(mt7996_qos_map, GFP_KERNEL);
++	if (!buf)
++		return -ENOMEM;
++
++	p = buf;
++	while ((tok = strsep(&p, ",")) != NULL) {
++		if (n >= ARRAY_SIZE(val) || kstrtou8(strim(tok), 0, &val[n])) {
++			ret = -EINVAL;
++			goto out;
++		}
++		n++;
++	}
++	if (n < 16 || (n - 16) % 2) {
++		ret = -EINVAL;
++		goto out;
++	}
++
++	memset(map, 0, sizeof(*map));
++	map->num_des = (n - 16) / 2;
++	for (i = 0; i < map->num_des; i++) {
++		map->dscp_exception[i].dscp = val[2 * i];
++		map->dscp_exception[i].up = val[2 * i + 1];
++	}
++	for (i = 0; i < 8; i++) {
++		map->up[i].low = val[2 * map->num_des + 2 * i];
++		map->up[i].high = val[2 * map->num_des + 2 * i + 1];
++	}
++out:
++	kfree(buf);
++	return ret;
++}
++
++/* same result as cfg80211_classify8021d() for an IP frame with this DSCP */
++static u8 mt7996_dscp_to_up(unsigned int dscp, struct cfg80211_qos_map *map)
++{
++	unsigned int i;
++
++	if (map) {
++		for (i = 0; i < map->num_des; i++)
++			if (dscp == map->dscp_exception[i].dscp)
++				return map->dscp_exception[i].up;
++		for (i = 0; i < 8; i++)
++			if (dscp >= map->up[i].low && dscp <= map->up[i].high)
++				return i;
++	}
++
++	switch (dscp) {
++	case 10: case 12: case 14: case 16:
++		return 0;
++	case 18: case 20: case 22:
++		return 3;
++	case 24: case 26: case 28: case 30:
++		return 4;
++	case 44: case 46:
++		return 6;
++	case 48:
++		return 7;
++	}
++	return dscp >> 3;
++}
++
++int mt7996_mcu_set_qos_map(struct mt7996_dev *dev, struct mt76_vif_link *mlink)
++{
++	struct {
++		u8 _rsv[4];
++
++		__le16 tag;
++		__le16 len;
++
++		struct {
++			u8 bss_idx;
++			u8 enable;
++			u8 _rsv[2];
++			u8 up[64];
++		} __packed data;
++	} __packed req = {
++		.tag = cpu_to_le16(UNI_CMD_SDO_SET_QOS_MAP),
++		.len = cpu_to_le16(sizeof(req) - 4),
++		.data = {
++			.bss_idx = mlink->idx,
++			.enable = true,
++		},
++	};
++	struct cfg80211_qos_map map, *mapp = &map;
++	int i, ret;
++
++	if (mt7996_parse_qos_map(&map))
++		mapp = NULL;
++
++	/* SDO takes the TID of an 802.3 frame from this table */
++	for (i = 0; i < ARRAY_SIZE(req.data.up); i++)
++		req.data.up[i] = mt7996_dscp_to_up(i, mapp);
++
++	if (mt7996_has_wa(dev))
++		ret = mt76_mcu_send_msg(&dev->mt76, MCU_WA_EXT_CMD(SET_QOS_MAP),
++					&req.data, sizeof(req.data), false);
++	else
++		ret = mt76_mcu_send_msg(&dev->mt76, MCU_WA_UNI_CMD(SDO), &req,
++					sizeof(req), false);
++
++	mt7996_mlo_dbg_log(dev, "SET_QOS_MAP bss %u map %s CS1->%u CS3->%u EF->%u ret %d\n",
++			   mlink->idx, mapp ? "hostapd" : "default",
++			   req.data.up[8], req.data.up[24], req.data.up[46], ret);
++	return ret;
++}
++
+ struct mt7996_mcu_countdown_data {
+ 	struct mt76_phy *mphy;
+ 	u8 omac_idx;
+diff --git a/mt7996/mcu.h b/mt7996/mcu.h
+index 63d6f29..91ed415 100644
+--- a/mt7996/mcu.h
++++ b/mt7996/mcu.h
+@@ -1177,6 +1177,7 @@ enum {
+ enum {
+ 	UNI_CMD_SDO_SET = 1,
+ 	UNI_CMD_SDO_QUERY,
++	UNI_CMD_SDO_SET_QOS_MAP = 4,
+ 	UNI_CMD_SDO_CP_MODE = 6,
+ };
+ 
+diff --git a/mt7996/mt7996.h b/mt7996/mt7996.h
+index 5c6e4c0..64552e9 100644
+--- a/mt7996/mt7996.h
++++ b/mt7996/mt7996.h
+@@ -836,6 +836,8 @@ int mt7996_mcu_add_sta(struct mt7996_dev *dev,
+ 		       struct mt7996_vif_link *link,
+ 		       struct mt7996_sta_link *msta_link,
+ 		       int conn_state, bool newly);
++int mt7996_mcu_set_qos_map(struct mt7996_dev *dev,
++			   struct mt76_vif_link *mlink);
+ int mt7996_mcu_set_peer_mld(struct mt7996_dev *dev, struct ieee80211_vif *vif,
+ 			    struct ieee80211_sta *sta);
+ int mt7996_mcu_teardown_mld_sta(struct mt7996_dev *dev,
+-- 
+2.47.3
+

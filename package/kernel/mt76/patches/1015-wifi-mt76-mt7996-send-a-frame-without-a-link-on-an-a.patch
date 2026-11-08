@@ -1,0 +1,143 @@
+From 82b05d1f78e2bcb2d48270ee598180ee57c10f63 Mon Sep 17 00:00:00 2001
+From: Claude Code <noreply@anthropic.com>
+Date: Sun, 8 Nov 2026 03:00:00 +0900
+Subject: [PATCH 1015/1015] wifi: mt76: mt7996: send a frame without a link on
+ an awake link of an MLD peer
+
+A WCN7850 (QCNCM865) MLO station runs its two links on one MAC when the
+load is low and keeps all but one link in power save. Which link stays
+awake differs from association to association.
+
+mac80211 sends some frames to an MLD peer without a link, ADDBA requests
+for example. mt7996_tx() puts them on the primary link. When the station
+keeps the primary link dozing, the frame is lost: the ADDBA request of a
+new TID gets no response, mac80211 retries four times and gives up
+(start_tx_ba ... -EBUSY), and the TID stays without aggregation. Data
+frames are fine, the firmware picks an awake link for them.
+
+The firmware PS sync events already keep MT_WCID_FLAG_PS per link wcid.
+Use it: when mac80211 gives no link and the primary link of an MLD peer
+is in power save, send the frame on a valid link that is awake. Count it
+in mt76/mlo_dbg.
+
+Tested on a Gemtek W1700K with a QCNCM865 (IOE_HMT.1.1-00018 firmware) on
+5 GHz ch36 + 6 GHz ch69: VI pings and VI uploads that set up a TID 5 BA
+session failed on 3 of 11 associations before (always when the station
+was awake on 5 GHz only), and passed on 18 of 18 after, 2 of them with
+the station awake on 5 GHz only.
+---
+ mt7996/debugfs.c |  7 +++++--
+ mt7996/main.c    | 41 ++++++++++++++++++++++++++++++++++++++++-
+ mt7996/mt7996.h  |  2 ++
+ 3 files changed, 47 insertions(+), 3 deletions(-)
+
+diff --git a/mt7996/debugfs.c b/mt7996/debugfs.c
+index 2580fe0..a2cccee 100644
+--- a/mt7996/debugfs.c
++++ b/mt7996/debugfs.c
+@@ -1076,6 +1076,8 @@ mt7996_mlo_dbg_show(struct seq_file *file, void *data)
+ 	for (l = 0; l < 4; l++)
+ 		seq_printf(file, " l%d=%u", l, d->txfree_link[l]);
+ 	seq_printf(file, " no_link_sta=%u\n", d->txfree_no_link_sta);
++	seq_printf(file, "mgmt sent on an awake link instead of a dozing primary: %u, all links dozing: %u\n",
++		   d->mgmt_awake_switch, d->mgmt_all_ps);
+ 	seq_puts(file, "tx_check_aggr: tid call not_qos bit_set start_ok start_err last_err\n");
+ 	for (tid = 0; tid < IEEE80211_NUM_TIDS; tid++)
+ 		seq_printf(file, "  %u %u %u %u %u %u %d\n", tid,
+@@ -1083,7 +1085,7 @@ mt7996_mlo_dbg_show(struct seq_file *file, void *data)
+ 			   d->aggr_bit_set[tid], d->aggr_start_ok[tid],
+ 			   d->aggr_start_err[tid], d->aggr_last_err[tid]);
+ 
+-	seq_puts(file, "MLO stations: wcid link phy valid | sta def sec peer_mld mld_idx conn ampdu ba_tx ba_rx\n");
++	seq_puts(file, "MLO stations: wcid link phy valid ps | sta def sec peer_mld mld_idx conn ampdu ba_tx ba_rx\n");
+ 	rcu_read_lock();
+ 	for (i = 0; i < ARRAY_SIZE(dev->mt76.wcid); i++) {
+ 		struct mt76_wcid *w = rcu_dereference(dev->mt76.wcid[i]);
+@@ -1100,8 +1102,9 @@ mt7996_mlo_dbg_show(struct seq_file *file, void *data)
+ 		msta = msta_link->sta;
+ 		if (!msta)
+ 			continue;
+-		seq_printf(file, "  %u %u %u %d | %pM %u %u 0x%x %u %u 0x%lx 0x%x 0x%x\n",
++		seq_printf(file, "  %u %u %u %d %d | %pM %u %u 0x%x %u %u 0x%lx 0x%x 0x%x\n",
+ 			   w->idx, w->link_id, w->phy_idx, w->link_valid,
++			   test_bit(MT_WCID_FLAG_PS, &w->flags),
+ 			   sta->addr, msta->deflink_id, msta->seclink_id,
+ 			   msta->peer_mld_links, msta->fw_mld_idx,
+ 			   msta->conn_state, msta->deflink.wcid.ampdu_state,
+diff --git a/mt7996/main.c b/mt7996/main.c
+index 01968bc..40c5139 100644
+--- a/mt7996/main.c
++++ b/mt7996/main.c
+@@ -2093,6 +2093,35 @@ mt7996_sta_state(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+ 	return mt7996_mac_sta_event(dev, vif, sta, ev);
+ }
+ 
++static u8 mt7996_sta_awake_link(struct mt7996_sta *msta,
++				struct ieee80211_sta *sta, u8 link_id)
++{
++	struct mt7996_sta_link *msta_link;
++	unsigned long valid = sta->valid_links;
++	unsigned int i;
++
++	msta_link = rcu_dereference(msta->link[link_id]);
++	if (!msta_link || !test_bit(MT_WCID_FLAG_PS, &msta_link->wcid.flags))
++		return link_id;
++
++	for_each_set_bit(i, &valid, IEEE80211_MLD_MAX_NUM_LINKS) {
++		struct mt7996_sta_link *other;
++
++		if (i == link_id)
++			continue;
++		other = rcu_dereference(msta->link[i]);
++		if (!other || !other->wcid.link_valid ||
++		    test_bit(MT_WCID_FLAG_PS, &other->wcid.flags))
++			continue;
++
++		mt7996_mlo_dbg.mgmt_awake_switch++;
++		return i;
++	}
++
++	mt7996_mlo_dbg.mgmt_all_ps++;
++	return link_id;
++}
++
+ static void mt7996_tx(struct ieee80211_hw *hw,
+ 		      struct ieee80211_tx_control *control,
+ 		      struct sk_buff *skb)
+@@ -2124,9 +2153,19 @@ static void mt7996_tx(struct ieee80211_hw *hw,
+ 	/* Use primary link_id if the value from mac80211 is set to
+ 	 * IEEE80211_LINK_UNSPECIFIED.
+ 	 */
+-	if (link_id == IEEE80211_LINK_UNSPECIFIED)
++	if (link_id == IEEE80211_LINK_UNSPECIFIED) {
+ 		link_id = deflink_id;
+ 
++		/* W1700K local: an MLD peer that runs its radios as a single
++		 * MAC (e.g. WCN7850 at low load) keeps all but one link in
++		 * power save. A frame without a link (ADDBA, action frames)
++		 * sent on a dozing primary link is lost, so take an awake
++		 * link instead.
++		 */
++		if (msta && sta->mlo)
++			link_id = mt7996_sta_awake_link(msta, sta, link_id);
++	}
++
+ 	if (vif && ieee80211_vif_is_mld(vif) &&
+ 	    !(info->flags & IEEE80211_TX_CTL_HW_80211_ENCAP)) {
+ 		struct ieee80211_bss_conf *link_conf;
+diff --git a/mt7996/mt7996.h b/mt7996/mt7996.h
+index 64552e9..c25b9f7 100644
+--- a/mt7996/mt7996.h
++++ b/mt7996/mt7996.h
+@@ -358,6 +358,8 @@ struct mt7996_mlo_dbg {
+ 	u32 tx_8023[IEEE80211_NUM_TIDS];
+ 	u32 txfree_link[IEEE80211_MLD_MAX_NUM_LINKS];
+ 	u32 txfree_no_link_sta;
++	u32 mgmt_awake_switch;
++	u32 mgmt_all_ps;
+ 	u32 aggr_call[IEEE80211_NUM_TIDS];
+ 	u32 aggr_not_qos[IEEE80211_NUM_TIDS];
+ 	u32 aggr_bit_set[IEEE80211_NUM_TIDS];
+-- 
+2.47.3
+

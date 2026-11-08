@@ -1,0 +1,116 @@
+From c7d147c6ddea41f34e1dec556e03004c94842564 Mon Sep 17 00:00:00 2001
+From: Felix Fietkau <nbd@nbd.name>
+Date: Wed, 28 Oct 2026 13:23:56 +0100
+Subject: [PATCH 1007/1012] wifi: mt76: read the chanctx of a link once
+
+mt76_vif_link_phy() and mt76_vif_phy() test mlink->ctx and then load it
+again to reach the mt76_chanctx. mt7996_tx(), mt7996_mac_sta_poll() from
+the TX free path, mt76_rx_beacon(), the beacon monitor and
+mt76_offchannel_notify() call mt76_vif_link_phy() without dev->mutex,
+while mt76_unassign_vif_chanctx() can set mlink->ctx to NULL in between.
+The second load can then return NULL.
+
+Load mlink->ctx once with acquire semantics, and publish it with
+release semantics in the chanctx functions, so that a reader that sees
+a chanctx also sees the link state written before it. Let
+mt76_vif_phy() use mt76_vif_link_phy() instead of its own copy.
+
+Fixes: 69d54ce7491d ("wifi: mt76: mt7996: switch to single multi-radio wiphy")
+Link: https://patch.msgid.link/20261028122403.796394-18-nbd@nbd.name
+Signed-off-by: Felix Fietkau <nbd@nbd.name>
+(cherry picked from commit 801f6a53f2f17bab3cdf33e4cf4ee7e8940578e3)
+---
+ channel.c  |  6 +++---
+ mac80211.c |  7 +------
+ mt76.h     | 15 +++++++++++++--
+ 3 files changed, 17 insertions(+), 11 deletions(-)
+
+diff --git a/channel.c b/channel.c
+index 192276c..7823a8d 100644
+--- a/channel.c
++++ b/channel.c
+@@ -133,7 +133,7 @@ int mt76_assign_vif_chanctx(struct ieee80211_hw *hw,
+ 		mlink_alloc = true;
+ 	}
+ 
+-	mlink->ctx = conf;
++	mt76_vif_link_ctx_set(mlink, conf);
+ 	ret = dev->drv->vif_link_add(phy, vif, link_conf, mlink);
+ 	if (ret) {
+ 		if (mlink_alloc)
+@@ -175,7 +175,7 @@ void mt76_unassign_vif_chanctx(struct ieee80211_hw *hw,
+ 		goto out;
+ 
+ 	dev->drv->vif_link_remove(phy, vif, link_conf, mlink);
+-	mlink->ctx = NULL;
++	mt76_vif_link_ctx_set(mlink, NULL);
+ out:
+ 	mutex_unlock(&dev->mutex);
+ }
+@@ -253,7 +253,7 @@ int mt76_switch_vif_chanctx(struct ieee80211_hw *hw,
+ 				goto out;
+ 		}
+ 
+-		mlink->ctx = v->new_ctx;
++		mt76_vif_link_ctx_set(mlink, v->new_ctx);
+ 		if (mlink->beacon_mon_interval)
+ 			WRITE_ONCE(mlink->beacon_mon_last, jiffies);
+ 	}
+diff --git a/mac80211.c b/mac80211.c
+index 41d3636..95f1c91 100644
+--- a/mac80211.c
++++ b/mac80211.c
+@@ -876,16 +876,11 @@ struct mt76_phy *mt76_vif_phy(struct ieee80211_hw *hw,
+ 			      struct ieee80211_vif *vif)
+ {
+ 	struct mt76_vif_link *mlink = (struct mt76_vif_link *)vif->drv_priv;
+-	struct mt76_chanctx *ctx;
+ 
+ 	if (!hw->wiphy->n_radio)
+ 		return hw->priv;
+ 
+-	if (!mlink->ctx)
+-		return NULL;
+-
+-	ctx = (struct mt76_chanctx *)mlink->ctx->drv_priv;
+-	return ctx->phy;
++	return mt76_vif_link_phy(mlink);
+ }
+ EXPORT_SYMBOL_GPL(mt76_vif_phy);
+ 
+diff --git a/mt76.h b/mt76.h
+index 63ba188..714221e 100644
+--- a/mt76.h
++++ b/mt76.h
+@@ -2175,15 +2175,26 @@ mt76_vif_conf_link(struct mt76_dev *dev, struct ieee80211_vif *vif,
+ 	return mt76_dereference(mvif->link[link_conf->link_id], dev);
+ }
+ 
++static inline void
++mt76_vif_link_ctx_set(struct mt76_vif_link *mlink,
++		      struct ieee80211_chanctx_conf *conf)
++{
++	/* pairs with smp_load_acquire() in mt76_vif_link_phy() */
++	smp_store_release(&mlink->ctx, conf);
++}
++
+ static inline struct mt76_phy *
+ mt76_vif_link_phy(struct mt76_vif_link *mlink)
+ {
++	struct ieee80211_chanctx_conf *conf;
+ 	struct mt76_chanctx *ctx;
+ 
+-	if (!mlink->ctx)
++	/* pairs with smp_store_release() in mt76_vif_link_ctx_set() */
++	conf = smp_load_acquire(&mlink->ctx);
++	if (!conf)
+ 		return NULL;
+ 
+-	ctx = (struct mt76_chanctx *)mlink->ctx->drv_priv;
++	ctx = (struct mt76_chanctx *)conf->drv_priv;
+ 
+ 	return ctx->phy;
+ }
+-- 
+2.47.3
+

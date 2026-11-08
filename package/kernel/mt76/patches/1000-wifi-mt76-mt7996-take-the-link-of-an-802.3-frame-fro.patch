@@ -1,0 +1,46 @@
+From 5eae83fcf5f2ecf683b037f6b09c082ca48de62c Mon Sep 17 00:00:00 2001
+From: Felix Fietkau <nbd@nbd.name>
+Date: Wed, 28 Oct 2026 13:23:39 +0100
+Subject: [PATCH 1000/1012] wifi: mt76: mt7996: take the link of an 802.3 frame
+ from its station
+
+mt7996_tx_prepare_skb() takes the link of every frame other than the
+QoS data of an MLO station from IEEE80211_TX_CTRL_MLO_LINK. mac80211
+does not set that field for 802.3 frames, as include/net/mac80211.h
+documents, so it reads 0.
+
+Since commit 729c83a3330c ("wifi: mt76: mt7996: fix reading zeroed
+info->control.flags after mt76_tx_status_skb_add()"),
+mt7996_mac_write_txwi() uses that link instead of the link of the wcid.
+When the host writes the TXD of an 802.3 frame to a non-MLO station on
+a link other than 0, the TXD thus names the BSS and band of link 0, and
+the frame is lost.
+
+Treat an 802.3 frame like one with IEEE80211_LINK_UNSPECIFIED, so that
+it takes the link of its wcid, as before that commit.
+
+Fixes: 729c83a3330c ("wifi: mt76: mt7996: fix reading zeroed info->control.flags after mt76_tx_status_skb_add()")
+Link: https://patch.msgid.link/20261028122403.796394-1-nbd@nbd.name
+Signed-off-by: Felix Fietkau <nbd@nbd.name>
+(cherry picked from commit 451f4737628000d9f5ab910b56b8c86114ffc441)
+---
+ mt7996/mac.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/mt7996/mac.c b/mt7996/mac.c
+index e064ae5..24c244e 100644
+--- a/mt7996/mac.c
++++ b/mt7996/mac.c
+@@ -949,6 +949,9 @@ int mt7996_tx_prepare_skb(struct mt76_dev *mdev, void *txwi_ptr,
+ 		u8 tid = tx_info->skb->priority & IEEE80211_QOS_CTL_TID_MASK;
+ 
+ 		link_id = (tid % 2) ? msta->seclink_id : msta->deflink_id;
++	} else if (is_8023) {
++		/* mac80211 does not set the MLO link of an 802.3 frame */
++		link_id = IEEE80211_LINK_UNSPECIFIED;
+ 	} else {
+ 		link_id = u32_get_bits(info->control.flags,
+ 				       IEEE80211_TX_CTRL_MLO_LINK);
+-- 
+2.47.3
+
